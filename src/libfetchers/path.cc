@@ -151,6 +151,10 @@ struct PathInputScheme : InputScheme
 
         auto accessor = makeFSSourceAccessor(absPath);
 
+        // Record the original filesystem root so that source-origins
+        // can map store paths back to their original locations.
+        accessor->originalRootPath = absPath;
+
         auto storePath = store.maybeParseStorePath(absPath.string());
 
         if (storePath) {

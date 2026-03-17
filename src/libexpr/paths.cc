@@ -2,6 +2,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/fetchers/fetch-to-store.hh"
+#include "nix/fetchers/fetchers.hh"
 
 namespace nix {
 
@@ -103,6 +104,18 @@ StorePath EvalState::mountInput(
         || (requireLockable && (!settings.lazyTrees || !settings.lazyLocks || !input.isLocked(fetchSettings))
             && !input.getNarHash()))
         input.attrs.insert_or_assign("narHash", getNarHash()->to_string(HashFormat::SRI, true));
+
+    // Record the mapping from this source store path to the original
+    // filesystem path so that source-origins can resolve provenance.
+    // Prefer the accessor's originalRootPath (set by git/path input schemes
+    // to the source tree root) over input.getSourcePath() (which returns
+    // the flake directory, not the git root for git-tracked flakes).
+    if (accessor->originalRootPath) {
+        sourceStoreToOriginalPath.try_emplace(storePath, *accessor->originalRootPath);
+    } else if (auto origPath = input.getSourcePath()) {
+        sourceStoreToOriginalPath.try_emplace(storePath, *origPath);
+        accessor->originalRootPath = *origPath;
+    }
 
     if (originalInput.getNarHash() && *getNarHash() != *originalInput.getNarHash())
         throw Error(
