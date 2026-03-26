@@ -526,31 +526,50 @@ Derivation parseDerivation(
  */
 static void printString(std::string & res, std::string_view s)
 {
+    /* Pre-reserve: in the common case no escaping is needed, so the output
+       is just 2 quotes + the original string length. Over-reserving slightly
+       is cheaper than repeated reallocations for large derivation strings. */
+    res.reserve(res.size() + s.size() + 2);
     res += '"';
-    static constexpr auto chunkSize = 1024;
-    std::array<char, 2 * chunkSize + 2> buffer;
+
+    /* Scan-and-copy: instead of checking every character individually,
+       find the next character that needs escaping and bulk-copy the safe
+       prefix. Most derivation strings are dominated by safe characters
+       (store paths, hashes), so this drastically reduces per-character
+       branch overhead. Callgrind showed this function at 3.9% of kronos
+       eval instructions. */
     while (!s.empty()) {
-        auto chunk = s.substr(0, /*n=*/chunkSize);
-        s.remove_prefix(chunk.size());
-        char * buf = buffer.data();
-        char * p = buf;
-        for (auto c : chunk)
-            if (c == '\"' || c == '\\') {
-                *p++ = '\\';
-                *p++ = c;
-            } else if (c == '\n') {
-                *p++ = '\\';
-                *p++ = 'n';
-            } else if (c == '\r') {
-                *p++ = '\\';
-                *p++ = 'r';
-            } else if (c == '\t') {
-                *p++ = '\\';
-                *p++ = 't';
-            } else
-                *p++ = c;
-        res.append(buf, p - buf);
+        /* Find the first character that requires escaping. */
+        size_t safe = 0;
+        while (safe < s.size()) {
+            auto c = static_cast<unsigned char>(s[safe]);
+            if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
+                break;
+            ++safe;
+        }
+
+        /* Bulk-copy safe prefix. */
+        if (safe > 0) {
+            res.append(s.data(), safe);
+            s.remove_prefix(safe);
+        }
+
+        /* Escape the special character (if any remain). */
+        if (!s.empty()) {
+            char esc[2] = {'\\', 0};
+            switch (s.front()) {
+            case '"':  esc[1] = '"';  break;
+            case '\\': esc[1] = '\\'; break;
+            case '\n': esc[1] = 'n';  break;
+            case '\r': esc[1] = 'r';  break;
+            case '\t': esc[1] = 't';  break;
+            default: __builtin_unreachable();
+            }
+            res.append(esc, 2);
+            s.remove_prefix(1);
+        }
     }
+
     res += '"';
 }
 
