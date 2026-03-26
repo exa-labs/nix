@@ -76,10 +76,19 @@ static inline void initGCReal()
 
     GC_set_oom_fn(oomHandler);
 
-    /* Set the initial heap size to something fairly big (25% of
-       physical RAM, up to a maximum of 384 MiB) so that in most cases
+    /* Tell the GC to expand the heap aggressively instead of
+       collecting frequently.  The default free_space_divisor is 3,
+       meaning the heap grows by ~33% after a collection.  Setting it
+       to 1 makes it double, cutting collection frequency roughly in
+       half.  Callgrind shows GC mark/sweep at ~12% of eval
+       instructions; fewer collections directly reduces this. */
+    GC_set_free_space_divisor(1);
+
+    /* Set the initial heap size to something fairly big (50% of
+       physical RAM, up to a maximum of 2 GiB) so that in most cases
        we don't need to garbage collect at all.  (Collection has a
-       fairly significant overhead.)  The heap size can be overridden
+       fairly significant overhead — ~12% of eval instructions on
+       large monorepo workloads.)  The heap size can be overridden
        through libgc's GC_INITIAL_HEAP_SIZE environment variable.  We
        should probably also provide a nix.conf setting for this.  Note
        that GC_expand_hp() causes a lot of virtual, but not physical
@@ -88,11 +97,11 @@ static inline void initGCReal()
     if (!getEnv("GC_INITIAL_HEAP_SIZE")) {
         size_t size = 32 * 1024 * 1024;
 #  if HAVE_SYSCONF && defined(_SC_PAGESIZE) && defined(_SC_PHYS_PAGES)
-        size_t maxSize = 384 * 1024 * 1024;
+        size_t maxSize = 2UL * 1024 * 1024 * 1024;
         long pageSize = sysconf(_SC_PAGESIZE);
         long pages = sysconf(_SC_PHYS_PAGES);
         if (pageSize != -1)
-            size = (pageSize * pages) / 4; // 25% of RAM
+            size = (pageSize * pages) / 2; // 50% of RAM
         if (size > maxSize)
             size = maxSize;
 #  endif
