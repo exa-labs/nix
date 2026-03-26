@@ -205,14 +205,22 @@ public:
         pointer current = nullptr;
 
         /**
-         * Whether iterating over a single attribute and not a merge chain.
+         * Iteration mode:
+         *   Single  – one layer, simple pointer walk (no merge needed)
+         *   TwoWay  – exactly two layers, fast two-pointer merge
+         *   MultiWay – 3+ layers, heap-based k-way merge
+         *
+         * The two-way fast path eliminates all heap operations for the most
+         * common layered case (a single // merge), which callgrind showed
+         * as ~5 % of total instructions in real nixpkgs evaluations.
          */
-        bool doMerge = true;
+        enum class Mode : uint8_t { Single, TwoWay, MultiWay };
+        Mode mode = Mode::Single;
 
         void push(BindingsCursor cursor) noexcept
         {
             cursorHeap.push_back(cursor);
-            std::ranges::make_heap(cursorHeap, comp);
+            std::ranges::push_heap(cursorHeap, comp);
         }
 
         [[nodiscard]] BindingsCursor pop() noexcept
@@ -257,39 +265,144 @@ public:
             return cursor;
         }
 
-        explicit iterator(const Bindings & attrs) noexcept
-            : doMerge(attrs.baseLayer)
-        {
-            auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
-                auto first = layer.attrs;
-                push(
-                    BindingsCursor{
-                        .current = first,
-                        .end = first + layer.numAttrs,
-                        .priority = priority++,
-                    });
-            };
+        /* --- Two-way merge helpers --- */
 
-            if (!doMerge) {
+        /**
+         * Find the initial element from two cursors stored at
+         * cursorHeap[0] (overlay, higher priority) and cursorHeap[1] (base).
+         */
+        void initTwoWay() noexcept
+        {
+            auto & overlay = cursorHeap[0];
+            auto & base = cursorHeap[1];
+
+            if (overlay.empty() && base.empty())
+                return;
+            if (overlay.empty()) {
+                current = base.current;
+                return;
+            }
+            if (base.empty()) {
+                current = overlay.current;
+                return;
+            }
+
+            if (overlay.current->name <= base.current->name) {
+                current = overlay.current;
+                /* If both layers define the same attr, skip the base copy. */
+                if (overlay.current->name == base.current->name)
+                    base.increment();
+            } else {
+                current = base.current;
+            }
+        }
+
+        /**
+         * Advance to the next element in a two-layer merge.
+         * Avoids all heap operations – just two pointer comparisons.
+         */
+        iterator & advanceTwoWay() noexcept
+        {
+            auto & overlay = cursorHeap[0];
+            auto & base = cursorHeap[1];
+            Symbol currentName = current->name;
+
+            /* Advance whichever cursor(s) produced the current element. */
+            if (!overlay.empty() && overlay.current->name == currentName)
+                overlay.increment();
+            if (!base.empty() && base.current->name == currentName)
+                base.increment();
+
+            bool has0 = !overlay.empty();
+            bool has1 = !base.empty();
+
+            if (!has0 && !has1)
+                return finished();
+            if (!has0) {
+                current = base.current;
+                return *this;
+            }
+            if (!has1) {
+                current = overlay.current;
+                return *this;
+            }
+
+            /* Both cursors have elements – pick the smaller name,
+               preferring the overlay on ties (it has higher priority). */
+            if (overlay.current->name < base.current->name) {
+                current = overlay.current;
+            } else if (overlay.current->name > base.current->name) {
+                current = base.current;
+            } else {
+                /* Equal names – overlay wins, skip base duplicate. */
+                current = overlay.current;
+                base.increment();
+            }
+            return *this;
+        }
+
+        /* --- Constructor --- */
+
+        explicit iterator(const Bindings & attrs) noexcept
+        {
+            if (!attrs.baseLayer) {
+                /* Single layer – no merge needed. */
+                mode = Mode::Single;
                 if (attrs.empty())
                     return;
 
                 current = attrs.attrs;
-                pushBindings(attrs);
-
+                cursorHeap.push_back(BindingsCursor{
+                    .current = attrs.attrs,
+                    .end = attrs.attrs + attrs.numAttrs,
+                    .priority = 0,
+                });
                 return;
             }
 
+            if (attrs.numLayers == 2) {
+                /* Two layers – fast two-pointer merge (no heap). */
+                mode = Mode::TwoWay;
+
+                /* cursorHeap[0] = overlay (higher priority, the front layer). */
+                cursorHeap.push_back(BindingsCursor{
+                    .current = attrs.attrs,
+                    .end = attrs.attrs + attrs.numAttrs,
+                    .priority = 0,
+                });
+                /* cursorHeap[1] = base. */
+                cursorHeap.push_back(BindingsCursor{
+                    .current = attrs.baseLayer->attrs,
+                    .end = attrs.baseLayer->attrs + attrs.baseLayer->numAttrs,
+                    .priority = 1,
+                });
+
+                initTwoWay();
+                return;
+            }
+
+            /* 3+ layers – heap-based k-way merge. */
+            mode = Mode::MultiWay;
+
             const Bindings * layer = &attrs;
+            unsigned priority = 0;
             while (layer) {
-                if (layer->numAttrs != 0)
-                    pushBindings(*layer);
+                if (layer->numAttrs != 0) {
+                    cursorHeap.push_back(BindingsCursor{
+                        .current = layer->attrs,
+                        .end = layer->attrs + layer->numAttrs,
+                        .priority = priority,
+                    });
+                }
+                priority++;
                 layer = layer->baseLayer;
             }
 
             if (cursorHeap.empty())
                 return;
 
+            /* Build the heap once instead of rebuilding after each push. */
+            std::ranges::make_heap(cursorHeap, comp);
             next(pop());
         }
 
@@ -308,22 +421,29 @@ public:
 
         iterator & operator++() noexcept
         {
-            if (!doMerge) {
+            switch (mode) {
+            case Mode::Single:
                 ++current;
                 if (current == cursorHeap.front().end)
                     return finished();
                 return *this;
+
+            case Mode::TwoWay:
+                return advanceTwoWay();
+
+            case Mode::MultiWay:
+                if (cursorHeap.empty())
+                    return finished();
+                {
+                    auto cursor = consumeAllUntilCurrentName();
+                    if (!cursor)
+                        return finished();
+                    next(*cursor);
+                }
+                return *this;
             }
 
-            if (cursorHeap.empty())
-                return finished();
-
-            auto cursor = consumeAllUntilCurrentName();
-            if (!cursor)
-                return finished();
-
-            next(*cursor);
-            return *this;
+            __builtin_unreachable();
         }
 
         iterator operator++(int) noexcept
@@ -349,23 +469,39 @@ public:
 
     /**
      * Get attribute by name or nullptr if no such attribute exists.
+     *
+     * For small chunks (≤ 8 elements), uses linear scan instead of binary
+     * search. Linear scan has better cache behavior and avoids branch
+     * mispredictions from the binary search pivot comparisons, making it
+     * faster for the small attribute sets that dominate in practice.
      */
     const Attr * get(Symbol name) const noexcept
     {
-        auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
-            auto first = chunk.attrs;
-            auto last = first + chunk.numAttrs;
-            const Attr * i = std::lower_bound(first, last, key);
-            if (i != last && i->name == key.name)
-                return i;
-            return nullptr;
-        };
+        static constexpr size_type linearScanThreshold = 8;
 
         const Bindings * currentChunk = this;
         while (currentChunk) {
-            const Attr * maybeAttr = getInChunk(*currentChunk);
-            if (maybeAttr)
-                return maybeAttr;
+            auto first = currentChunk->attrs;
+            auto n = currentChunk->numAttrs;
+
+            if (n <= linearScanThreshold) {
+                /* Linear scan for small chunks. Since attrs are sorted,
+                   we can stop early when we pass the target name. */
+                for (size_type i = 0; i < n; ++i) {
+                    if (first[i].name == name)
+                        return &first[i];
+                    if (first[i].name > name)
+                        break;
+                }
+            } else {
+                /* Binary search for larger chunks. */
+                auto last = first + n;
+                auto key = Attr{name, nullptr};
+                const Attr * i = std::lower_bound(first, last, key);
+                if (i != last && i->name == name)
+                    return i;
+            }
+
             currentChunk = currentChunk->baseLayer;
         }
 
