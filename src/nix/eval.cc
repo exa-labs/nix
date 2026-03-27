@@ -75,23 +75,26 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             if (auto flakeInstallable = dynamic_cast<InstallableFlake *>(&*installable)) {
                 try {
                     auto cursor = flakeInstallable->getCursor(*state);
-                    auto cachedStr = cursor->getStringWithContext();
-                    /* getStringWithContext() throws on cache miss, so if we
-                       reach here we have a valid cached value (even if empty). */
-                    if (raw) {
-                        logger->stop();
-                        writeFull(getStandardOutput(), cachedStr.first);
-                    } else if (json) {
-                        printJSON(nlohmann::json(cachedStr.first));
-                    } else {
-                        /* Use Nix-style string escaping (printLiteralString) to
-                           match the normal ValuePrinter output path exactly.
-                           This ensures identical output regardless of cache state. */
-                        std::ostringstream out;
-                        printLiteralString(out, cachedStr.first);
-                        logger->cout("%s", out.str());
+                    /* Use cachedGetStringWithContext() which only returns a
+                       result on a true eval-cache hit.  Unlike getStringWithContext(),
+                       it does NOT fall through to forceValue() on cache miss,
+                       so we are guaranteed to only use genuinely cached values. */
+                    auto cachedStr = cursor->cachedGetStringWithContext();
+                    if (cachedStr) {
+                        if (raw) {
+                            logger->stop();
+                            writeFull(getStandardOutput(), cachedStr->first);
+                        } else if (json) {
+                            printJSON(nlohmann::json(cachedStr->first));
+                        } else {
+                            /* Use Nix-style string escaping (printLiteralString) to
+                               match the normal ValuePrinter output path exactly. */
+                            std::ostringstream out;
+                            printLiteralString(out, cachedStr->first);
+                            logger->cout("%s", out.str());
+                        }
+                        return;
                     }
-                    return;
                 } catch (...) {
                     /* Cache miss or error — fall through to full evaluation. */
                 }
