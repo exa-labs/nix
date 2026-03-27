@@ -178,8 +178,9 @@ struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
                 // contents to get file-level precision.  The store path IS the
                 // filtered result, so its contents are exactly what passed the
                 // filter.  Map each file back to its original source location.
-                auto sourcePathStr = entry.value("sourcePath", "");
-                if (!sourcePathStr.empty() && sourcePathStr != "null") {
+                auto & spVal = entry["sourcePath"];
+                auto sourcePathStr = (spVal.is_string()) ? spVal.get<std::string>() : std::string{};
+                if (!sourcePathStr.empty()) {
                     auto storePathStr = store->printStorePath(inputSrc);
                     try {
                         namespace fs = std::filesystem;
