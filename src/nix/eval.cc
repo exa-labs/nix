@@ -1,9 +1,11 @@
 #include "nix/cmd/command-installable-value.hh"
+#include "nix/cmd/installable-flake.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/eval-cache.hh"
 #include "nix/expr/value-to-json.hh"
 
 #include <nlohmann/json.hpp>
@@ -63,6 +65,35 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             throw UsageError("--raw and --json are mutually exclusive");
 
         auto state = getEvalState();
+
+        /* Fast path: if this is a simple flake string attribute eval (no --apply,
+           no --write-to, no --json), try to serve it directly from the eval cache.
+           This avoids the expensive derivationStrict computation when the flake
+           inputs haven't changed. */
+        if (!apply && !writeTo) {
+            if (auto flakeInstallable = dynamic_cast<InstallableFlake *>(&*installable)) {
+                try {
+                    auto cursor = flakeInstallable->getCursor(*state);
+                    auto cachedStr = cursor->getStringWithContext();
+                    if (!cachedStr.first.empty()) {
+                        /* Verify that all store paths in the context are still valid.
+                           The getString/getStringWithContext methods already do this check,
+                           so if we get here the paths are valid. */
+                        if (raw) {
+                            logger->stop();
+                            writeFull(getStandardOutput(), cachedStr.first);
+                        } else if (json) {
+                            printJSON(nlohmann::json(cachedStr.first));
+                        } else {
+                            logger->cout("%s", nlohmann::json(cachedStr.first).dump());
+                        }
+                        return;
+                    }
+                } catch (...) {
+                    /* Cache miss or error — fall through to full evaluation. */
+                }
+            }
+        }
 
         auto [v, pos] = installable->toValue(*state);
         NixStringContext context;
