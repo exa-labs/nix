@@ -2275,12 +2275,18 @@ void EvalState::forceValueSlowPath(Value & v, const PosIdx pos)
     /* ── Handle thunks ─────────────────────────────────────────── */
     if (v.isThunk()) {
         if (!parallel) {
-            /* Single-threaded blackhole — infinite recursion. */
+            /* Single-threaded path — either a blackhole (infinite
+               recursion) or a race where parallelEvalActive dropped
+               to 0 between the caller's relaxed check and our acquire
+               re-read.  Handle both by just doing the inline force. */
             Env * env = v.thunk().env;
             Expr * expr = v.thunk().expr;
-            assert(!env);
             try {
-                ExprBlackHole::throwInfiniteRecursionError(*this, v);
+                v.mkBlackhole();
+                if (env) [[likely]]
+                    expr->eval(*this, *env, v);
+                else
+                    ExprBlackHole::throwInfiniteRecursionError(*this, v);
             } catch (...) {
                 handleEvalExceptionForThunk(env, expr, v, pos);
                 throw;
@@ -2312,16 +2318,15 @@ void EvalState::forceValueSlowPath(Value & v, const PosIdx pos)
             lock.unlock();
             if (isBeingForcedByCurrentThread(&v)) {
                 /* Same thread — genuine infinite recursion.
-                   Re-enter the original code path so that
-                   handleEvalExceptionForThunk → tryFixupBlackHolePos
-                   can attach caller position info to the error. */
+                   Use throwInfiniteRecursionError (not expr->eval
+                   which would dereference the null env). */
                 try {
-                    expr->eval(*this, *env, v);
+                    ExprBlackHole::throwInfiniteRecursionError(*this, v);
                 } catch (...) {
                     handleEvalExceptionForThunk(env, expr, v, pos);
                     throw;
                 }
-                /* unreachable — eval of blackhole always throws */
+                /* unreachable — throwInfiniteRecursionError always throws */
             }
             /* Another thread owns it — spin-wait until done. */
             while (v.isThunk()) {
@@ -2361,8 +2366,19 @@ handle_app:
 
         if (!v.isApp()) {
             lock.unlock();
-            if (v.isThunk())
-                goto handle_thunk_recheck;
+            if (v.isThunk()) {
+                /* Another thread is forcing this value — spin-wait. */
+                while (v.isThunk()) {
+#if defined(__x86_64__)
+                    __builtin_ia32_pause();
+#else
+                    std::this_thread::yield();
+#endif
+                }
+                if (v.isFailed())
+                    handleEvalFailed(v, pos);
+                return;
+            }
             if (v.isFailed())
                 handleEvalFailed(v, pos);
             return;
@@ -2435,9 +2451,13 @@ void EvalState::forceValueDeep(Value & v)
             auto & attrs = *v.attrs();
             size_t size = attrs.size();
 
-            if (size >= kMinParallelAttrs && !debugRepl) {
-                /* ── Parallel path: distribute attrs across threads ── */
+            if (size >= kMinParallelAttrs && !debugRepl && tl_parallelForceDepth == 0) {
+                /* ── Parallel path: distribute attrs across threads ──
+                 * Only parallelize at the top level (tl_parallelForceDepth==0)
+                 * to avoid deadlock from recursive task submission into the
+                 * fixed-size thread pool.  Workers force subtrees inline. */
                 ParallelEvalGuard pGuard;
+                ++tl_parallelForceDepth;
                 auto & pool = getThreadPool();
 
                 std::vector<std::future<void>> futures;
@@ -2463,10 +2483,12 @@ void EvalState::forceValueDeep(Value & v)
                 for (auto & f : futures)
                     f.wait();
 
+                --tl_parallelForceDepth;
+
                 if (firstErr)
                     std::rethrow_exception(firstErr);
             } else {
-                /* ── Sequential path (small attrset or debug mode) ── */
+                /* ── Sequential path (small attrset, debug mode, or nested) ── */
                 for (auto & i : attrs)
                     try {
                         auto dts = this->debugRepl && i.value->isThunk()
@@ -2492,9 +2514,10 @@ void EvalState::forceValueDeep(Value & v)
             auto view = v.listView();
             size_t size = view.size();
 
-            if (size >= kMinParallelListElems && !debugRepl) {
-                /* ── Parallel path for large lists ──────────────────── */
+            if (size >= kMinParallelListElems && !debugRepl && tl_parallelForceDepth == 0) {
+                /* ── Parallel path for large lists (top-level only) ─── */
                 ParallelEvalGuard pGuard;
+                ++tl_parallelForceDepth;
                 auto & pool = getThreadPool();
 
                 std::vector<std::future<void>> futures;
@@ -2518,10 +2541,12 @@ void EvalState::forceValueDeep(Value & v)
                 for (auto & f : futures)
                     f.wait();
 
+                --tl_parallelForceDepth;
+
                 if (firstErr)
                     std::rethrow_exception(firstErr);
             } else {
-                /* ── Sequential path for small lists ────────────────── */
+                /* ── Sequential path for small lists or nested ──────── */
                 size_t index = 0;
                 for (auto v2 : view)
                     try {

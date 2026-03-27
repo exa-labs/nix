@@ -129,6 +129,15 @@ inline thread_local size_t tl_callDepth = 0;
 inline constexpr size_t kMinParallelAttrs = 64;
 inline constexpr size_t kMinParallelListElems = 128;
 
+/* ── Thread-local parallel-forcing depth ───────────────────────────
+ *
+ * Only the outermost forceValueDeep invocation should submit work to
+ * the thread pool.  Workers that recursively encounter large attrsets
+ * or lists force them sequentially to avoid deadlock from recursive
+ * task submission into a fixed-size pool.
+ */
+inline thread_local int tl_parallelForceDepth = 0;
+
 /* ── RAII guard that increments/decrements parallelEvalActive ──── */
 struct ParallelEvalGuard
 {
