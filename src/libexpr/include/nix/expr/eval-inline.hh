@@ -98,28 +98,42 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
     /* The most common case is that v is already forced (not a thunk, app, or
        failed). Mark all three branches as unlikely so the compiler optimizes
        the fast fall-through path for already-evaluated values. A given value
-       is forced at most once but may be read many times after that. */
+       is forced at most once but may be read many times after that.
+
+       Thread safety: when parallelEvalActive > 0 we must use the outlined
+       slow path with striped spinlocks to atomically claim thunks.  When
+       no parallel eval is running (the overwhelmingly common case for
+       `nix eval .#foo.drvPath`), we inline the original code path with
+       zero overhead.  The fast path (already evaluated) never needs
+       synchronisation because a forced value is never mutated again. */
     if (v.isThunk()) [[unlikely]] {
         Env * env = v.thunk().env;
-        assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
-        try {
-            v.mkBlackhole();
-            if (env) [[likely]]
+        if (!env || parallelEvalActive.load(std::memory_order_relaxed) > 0) [[unlikely]] {
+            /* Blackhole (infinite recursion or cross-thread conflict)
+               or parallel eval active — use the outlined locked path. */
+            forceValueSlowPath(v, pos);
+        } else {
+            /* Single-threaded fast path — identical to original code. */
+            try {
+                v.mkBlackhole();
                 expr->eval(*this, *env, v);
-            else
-                ExprBlackHole::throwInfiniteRecursionError(*this, v);
-        } catch (...) {
-            handleEvalExceptionForThunk(env, expr, v, pos);
-            throw;
+            } catch (...) {
+                handleEvalExceptionForThunk(env, expr, v, pos);
+                throw;
+            }
         }
     } else if (v.isApp()) [[unlikely]] {
-        Value savedApp = v;
-        try {
-            callFunction(*v.app().left, *v.app().right, v, pos);
-        } catch (...) {
-            handleEvalExceptionForApp(v, savedApp);
-            throw;
+        if (parallelEvalActive.load(std::memory_order_relaxed) > 0) [[unlikely]] {
+            forceValueSlowPath(v, pos);
+        } else {
+            Value savedApp = v;
+            try {
+                callFunction(*v.app().left, *v.app().right, v, pos);
+            } catch (...) {
+                handleEvalExceptionForApp(v, savedApp);
+                throw;
+            }
         }
     } else if (v.isFailed()) [[unlikely]] {
         handleEvalFailed(v, pos);
@@ -159,10 +173,10 @@ inline void EvalState::forceList(Value & v, const PosIdx pos, std::string_view e
 [[gnu::always_inline]]
 inline CallDepth EvalState::addCallDepth(const PosIdx pos)
 {
-    if (callDepth > settings.maxCallDepth)
+    if (tl_callDepth > settings.maxCallDepth)
         error<StackOverflowError>().atPos(pos).debugThrow();
 
-    return CallDepth(callDepth);
+    return CallDepth();
 };
 
 } // namespace nix
