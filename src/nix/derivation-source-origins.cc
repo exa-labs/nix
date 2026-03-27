@@ -19,15 +19,14 @@ using json = nlohmann::json;
 
 struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
 {
-    bool recursive = false;
+    bool recursive = true;
 
     CmdDerivationSourceOrigins()
     {
         addFlag({
-            .longName = "recursive",
-            .shortName = 'r',
-            .description = "Include the dependencies of the specified derivations.",
-            .handler = {&recursive, true},
+            .longName = "no-recursive",
+            .description = "Only show the top-level derivation's inputSrcs (skip transitive inputDrvs).",
+            .handler = {&recursive, false},
         });
     }
 
@@ -179,8 +178,9 @@ struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
                 // contents to get file-level precision.  The store path IS the
                 // filtered result, so its contents are exactly what passed the
                 // filter.  Map each file back to its original source location.
-                auto sourcePathStr = entry.value("sourcePath", "");
-                if (!sourcePathStr.empty() && sourcePathStr != "null") {
+                auto & spVal = entry["sourcePath"];
+                auto sourcePathStr = (spVal.is_string()) ? spVal.get<std::string>() : std::string{};
+                if (!sourcePathStr.empty()) {
                     auto storePathStr = store->printStorePath(inputSrc);
                     try {
                         namespace fs = std::filesystem;
