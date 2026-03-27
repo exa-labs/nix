@@ -532,21 +532,25 @@ static void printString(std::string & res, std::string_view s)
     res.reserve(res.size() + s.size() + 2);
     res += '"';
 
-    /* Scan-and-copy: instead of checking every character individually,
-       find the next character that needs escaping and bulk-copy the safe
-       prefix. Most derivation strings are dominated by safe characters
-       (store paths, hashes), so this drastically reduces per-character
-       branch overhead. Callgrind showed this function at 3.9% of kronos
-       eval instructions. */
+    /* Scan-and-copy with a lookup table: a single indexed load per
+       character replaces the 5-way comparison chain. Most derivation
+       strings are dominated by safe characters (store paths, hashes),
+       so the scan loop runs many iterations per escapable char. */
+    static constexpr auto needsEscape = []() constexpr {
+        std::array<bool, 256> table{};
+        table['"']  = true;
+        table['\\'] = true;
+        table['\n'] = true;
+        table['\r'] = true;
+        table['\t'] = true;
+        return table;
+    }();
+
     while (!s.empty()) {
         /* Find the first character that requires escaping. */
         size_t safe = 0;
-        while (safe < s.size()) {
-            auto c = static_cast<unsigned char>(s[safe]);
-            if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
-                break;
+        while (safe < s.size() && !needsEscape[static_cast<unsigned char>(s[safe])])
             ++safe;
-        }
 
         /* Bulk-copy safe prefix. */
         if (safe > 0) {
