@@ -56,9 +56,15 @@ R""(
 # Description
 
 This command evaluates the given [*installables*](./nix.md#installables)
-and, for each resulting [store derivation], prints a JSON object mapping
-every `inputSrc` store path back to the original filesystem path that was
-copied into the store during evaluation.
+and, for each resulting [store derivation], recursively traces the full
+derivation closure (`inputDrvs` → `inputSrcs`) and prints a JSON object
+mapping every `inputSrc` store path back to the original filesystem path
+that was copied into the store during evaluation.
+
+By default the command is **recursive**: it follows all transitive
+`inputDrvs` to collect the complete set of `inputSrcs` across the
+entire build closure.  Pass `--no-recursive` to restrict output to
+only the top-level derivation's direct `inputSrcs`.
 
 This is useful for build-system tooling that needs to know which working-tree
 directories contributed to a derivation's build inputs — for example, to
@@ -89,4 +95,4 @@ files that passed the filter.
 
 [store derivation]: @docroot@/glossary.md#gloss-store-derivation
 
-)"" 
+)""  

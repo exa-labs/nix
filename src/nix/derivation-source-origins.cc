@@ -19,15 +19,14 @@ using json = nlohmann::json;
 
 struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
 {
-    bool recursive = false;
+    bool recursive = true;
 
     CmdDerivationSourceOrigins()
     {
         addFlag({
-            .longName = "recursive",
-            .shortName = 'r',
-            .description = "Include the dependencies of the specified derivations.",
-            .handler = {&recursive, true},
+            .longName = "no-recursive",
+            .description = "Only show the top-level derivation's inputSrcs (skip transitive inputDrvs).",
+            .handler = {&recursive, false},
         });
     }
 
