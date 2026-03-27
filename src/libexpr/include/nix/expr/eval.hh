@@ -17,6 +17,7 @@
 #include "nix/expr/repl-exit-status.hh"
 #include "nix/util/ref.hh"
 #include "nix/expr/counter.hh"
+#include "nix/expr/parallel-eval.hh"
 
 // For `NIX_USE_BOEHMGC`, and if that's set, `GC_THREADS`
 #include "nix/expr/config.hh"
@@ -58,21 +59,20 @@ class EvalCache;
 
 /**
  * Increments a count on construction and decrements on destruction.
+ * Uses the thread-local call depth counter so that worker threads
+ * get their own independent stack-depth tracking.
  */
 class CallDepth
 {
-    size_t & count;
-
 public:
-    CallDepth(size_t & count)
-        : count(count)
+    CallDepth()
     {
-        ++count;
+        ++tl_callDepth;
     }
 
     ~CallDepth()
     {
-        --count;
+        --tl_callDepth;
     }
 };
 
@@ -672,6 +672,12 @@ private:
 
     void tryFixupBlackHolePos(Value & v, PosIdx pos);
 
+    /**
+     * Thread-safe thunk forcing: outlined slow path called from
+     * the inline forceValue() when v is a thunk or app.
+     */
+    [[gnu::noinline]] void forceValueSlowPath(Value & v, const PosIdx pos);
+
 public:
 
     /**
@@ -894,11 +900,8 @@ private:
         const SourcePath & basePath,
         const std::shared_ptr<StaticEnv> & staticEnv);
 
-    /**
-     * Current Nix call stack depth, used with `max-call-depth` setting to throw stack overflow hopefully before we run
-     * out of system stack.
-     */
-    size_t callDepth = 0;
+    /* callDepth is now the thread-local tl_callDepth from parallel-eval.hh
+       so that worker threads get independent stack-depth tracking. */
 
 public:
 
@@ -1103,6 +1106,12 @@ private:
     friend void prim_getAttr(EvalState & state, const PosIdx pos, Value ** args, Value & v);
     friend void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v);
     friend void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v);
+
+    /** Thread pool for parallel forceValueDeep. Created lazily. */
+    std::unique_ptr<EvalThreadPool> evalThreadPool;
+
+    /** Ensure the thread pool is initialised. */
+    EvalThreadPool & getThreadPool();
 
     friend struct Value;
     friend class ListBuilder;
