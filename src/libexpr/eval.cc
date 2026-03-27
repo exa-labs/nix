@@ -1516,8 +1516,10 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
     if (neededHooks.test(EvalProfiler::preFunctionCall)) [[unlikely]]
         profiler.preFunctionCallHook(*this, fun, args, pos);
 
-    Finally traceExit_{[&]() {
-        if (profiler.getNeededHooks().test(EvalProfiler::postFunctionCall)) [[unlikely]]
+    /* Cache the postFunctionCall hook check to avoid re-querying
+       profiler.getNeededHooks() on every function return. */
+    Finally traceExit_{[&, needsPostHook = neededHooks.test(EvalProfiler::postFunctionCall)]() {
+        if (needsPostHook) [[unlikely]]
             profiler.postFunctionCallHook(*this, fun, args, pos);
     }};
 
@@ -2071,7 +2073,10 @@ void EvalState::concatLists(
 void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
 {
     NixStringContext context;
-    std::vector<BackedStringView> strings;
+    /* Use a stack-allocated small vector for the common case of string
+       interpolations with a small number of segments, avoiding a heap
+       allocation on every string concatenation. */
+    boost::container::small_vector<BackedStringView, 8> strings;
     size_t sSize = 0;
     NixInt n{0};
     NixFloat nf = 0;
@@ -2903,14 +2908,17 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
 {
     auto _level = addCallDepth(pos);
 
+    /* Check pointer equality early: if both references alias the same
+       Value we only need one forceValue and can return immediately.
+       This is common when the same binding is compared to itself
+       (e.g. in set equality, uniqList, etc.). */
+    if (&v1 == &v2) {
+        forceValue(v1, pos);
+        return true;
+    }
+
     forceValue(v1, pos);
     forceValue(v2, pos);
-
-    /* !!! Hack to support some old broken code that relies on pointer
-       equality tests between sets.  (Specifically, builderDefs calls
-       uniqList on a list of sets.)  Will remove this eventually. */
-    if (&v1 == &v2)
-        return true;
 
     // Special case type-compatibility between float and int
     if (v1.type() == nInt && v2.type() == nFloat)

@@ -95,7 +95,11 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    if (v.isThunk()) {
+    /* The most common case is that v is already forced (not a thunk, app, or
+       failed). Mark all three branches as unlikely so the compiler optimizes
+       the fast fall-through path for already-evaluated values. A given value
+       is forced at most once but may be read many times after that. */
+    if (v.isThunk()) [[unlikely]] {
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
@@ -109,7 +113,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForThunk(env, expr, v, pos);
             throw;
         }
-    } else if (v.isApp()) {
+    } else if (v.isApp()) [[unlikely]] {
         Value savedApp = v;
         try {
             callFunction(*v.app().left, *v.app().right, v, pos);
@@ -117,7 +121,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
-    } else if (v.isFailed()) {
+    } else if (v.isFailed()) [[unlikely]] {
         handleEvalFailed(v, pos);
     }
 }
