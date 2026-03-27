@@ -2451,7 +2451,7 @@ void EvalState::forceValueDeep(Value & v)
             auto & attrs = *v.attrs();
             size_t size = attrs.size();
 
-            if (size >= kMinParallelAttrs && !debugRepl && tl_parallelForceDepth == 0) {
+            if (size >= kMinParallelAttrs && !debugRepl && !countCalls && tl_parallelForceDepth == 0) {
                 /* ── Parallel path: distribute attrs across threads ──
                  * Only parallelize at the top level (tl_parallelForceDepth==0)
                  * to avoid deadlock from recursive task submission into the
@@ -2517,7 +2517,7 @@ void EvalState::forceValueDeep(Value & v)
             auto view = v.listView();
             size_t size = view.size();
 
-            if (size >= kMinParallelListElems && !debugRepl && tl_parallelForceDepth == 0) {
+            if (size >= kMinParallelListElems && !debugRepl && !countCalls && tl_parallelForceDepth == 0) {
                 /* ── Parallel path for large lists (top-level only) ─── */
                 ParallelEvalGuard pGuard;
                 ParallelForceDepthGuard depthGuard;
