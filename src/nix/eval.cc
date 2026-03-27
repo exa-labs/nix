@@ -7,6 +7,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-cache.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/expr/print.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -75,20 +76,22 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
                 try {
                     auto cursor = flakeInstallable->getCursor(*state);
                     auto cachedStr = cursor->getStringWithContext();
-                    if (!cachedStr.first.empty()) {
-                        /* Verify that all store paths in the context are still valid.
-                           The getString/getStringWithContext methods already do this check,
-                           so if we get here the paths are valid. */
-                        if (raw) {
-                            logger->stop();
-                            writeFull(getStandardOutput(), cachedStr.first);
-                        } else if (json) {
-                            printJSON(nlohmann::json(cachedStr.first));
-                        } else {
-                            logger->cout("%s", nlohmann::json(cachedStr.first).dump());
-                        }
-                        return;
+                    /* getStringWithContext() throws on cache miss, so if we
+                       reach here we have a valid cached value (even if empty). */
+                    if (raw) {
+                        logger->stop();
+                        writeFull(getStandardOutput(), cachedStr.first);
+                    } else if (json) {
+                        printJSON(nlohmann::json(cachedStr.first));
+                    } else {
+                        /* Use Nix-style string escaping (printLiteralString) to
+                           match the normal ValuePrinter output path exactly.
+                           This ensures identical output regardless of cache state. */
+                        std::ostringstream out;
+                        printLiteralString(out, cachedStr.first);
+                        logger->cout("%s", out.str());
                     }
+                    return;
                 } catch (...) {
                     /* Cache miss or error — fall through to full evaluation. */
                 }
