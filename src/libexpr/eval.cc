@@ -2457,7 +2457,7 @@ void EvalState::forceValueDeep(Value & v)
                  * to avoid deadlock from recursive task submission into the
                  * fixed-size thread pool.  Workers force subtrees inline. */
                 ParallelEvalGuard pGuard;
-                ++tl_parallelForceDepth;
+                ParallelForceDepthGuard depthGuard;
                 auto & pool = getThreadPool();
 
                 std::vector<std::future<void>> futures;
@@ -2470,6 +2470,11 @@ void EvalState::forceValueDeep(Value & v)
 
                 for (auto & i : attrs) {
                     futures.push_back(pool.submit([&, val = i.value]() {
+                        /* Each worker must mark itself as nested so that
+                           recurse() on this thread won't re-enter the
+                           parallel path (tl_parallelForceDepth is TLS,
+                           so workers start at 0 without this). */
+                        ParallelForceDepthGuard workerDepthGuard;
                         try {
                             recurse(*val);
                         } catch (...) {
@@ -2482,8 +2487,6 @@ void EvalState::forceValueDeep(Value & v)
 
                 for (auto & f : futures)
                     f.wait();
-
-                --tl_parallelForceDepth;
 
                 if (firstErr)
                     std::rethrow_exception(firstErr);
@@ -2517,7 +2520,7 @@ void EvalState::forceValueDeep(Value & v)
             if (size >= kMinParallelListElems && !debugRepl && tl_parallelForceDepth == 0) {
                 /* ── Parallel path for large lists (top-level only) ─── */
                 ParallelEvalGuard pGuard;
-                ++tl_parallelForceDepth;
+                ParallelForceDepthGuard depthGuard;
                 auto & pool = getThreadPool();
 
                 std::vector<std::future<void>> futures;
@@ -2528,6 +2531,7 @@ void EvalState::forceValueDeep(Value & v)
 
                 for (auto v2 : view) {
                     futures.push_back(pool.submit([&, v2]() {
+                        ParallelForceDepthGuard workerDepthGuard;
                         try {
                             recurse(*v2);
                         } catch (...) {
@@ -2540,8 +2544,6 @@ void EvalState::forceValueDeep(Value & v)
 
                 for (auto & f : futures)
                     f.wait();
-
-                --tl_parallelForceDepth;
 
                 if (firstErr)
                     std::rethrow_exception(firstErr);

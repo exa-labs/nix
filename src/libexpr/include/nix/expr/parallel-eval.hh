@@ -135,8 +135,22 @@ inline constexpr size_t kMinParallelListElems = 128;
  * the thread pool.  Workers that recursively encounter large attrsets
  * or lists force them sequentially to avoid deadlock from recursive
  * task submission into a fixed-size pool.
+ *
+ * Because this is thread_local, each pool worker starts at 0.  The
+ * worker lambdas in forceValueDeep must create a ParallelForceDepthGuard
+ * so that nested recurse() calls on workers see depth > 0 and stay
+ * sequential.
  */
 inline thread_local int tl_parallelForceDepth = 0;
+
+/* ── RAII guard for tl_parallelForceDepth ──────────────────────── */
+struct ParallelForceDepthGuard
+{
+    ParallelForceDepthGuard() { ++tl_parallelForceDepth; }
+    ~ParallelForceDepthGuard() { --tl_parallelForceDepth; }
+    ParallelForceDepthGuard(const ParallelForceDepthGuard &) = delete;
+    ParallelForceDepthGuard & operator=(const ParallelForceDepthGuard &) = delete;
+};
 
 /* ── RAII guard that increments/decrements parallelEvalActive ──── */
 struct ParallelEvalGuard
@@ -163,8 +177,22 @@ public:
         }
         numThreads_ = numThreads;
 
-        for (size_t i = 0; i < numThreads; ++i) {
-            workers_.emplace_back([this] { workerLoop(); });
+        try {
+            for (size_t i = 0; i < numThreads; ++i) {
+                workers_.emplace_back([this] { workerLoop(); });
+            }
+        } catch (...) {
+            /* If thread creation partially fails, cleanly shut down
+               the threads that were already started.  Destroying a
+               joinable std::thread calls std::terminate(). */
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                stop_ = true;
+            }
+            cv_.notify_all();
+            for (auto & w : workers_)
+                w.join();
+            throw;
         }
     }
 
