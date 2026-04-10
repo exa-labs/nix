@@ -1258,15 +1258,24 @@ void FileTransfer::download(
        sink is expensive (e.g. one that does decompression and writing
        to the Nix store), it would stall the download thread too much.
        Therefore we use a buffer to communicate data between the
-       download thread and the calling thread. */
+       download thread and the calling thread.
+
+       We never pause the transfer via curl_easy_pause(). Pausing
+       collapses the TCP receive window (rcv_wnd shrinks to ~7 KB
+       vs normal ~80 KB) and, with HTTP/2, triggers WINDOW_UPDATE
+       round-trips on every pause/unpause cycle. For large downloads
+       where the sink is slow (e.g. store imports at ~5 MB/s while
+       curl bursts at 300+ MB/s), this throttles effective throughput
+       by 60x. Instead we let the buffer grow unboundedly so curl
+       always runs at wire speed. Peak memory equals the full download
+       size, which matches S3BinaryCacheStore's existing behavior. */
 
     struct State
     {
         bool quit = false;
-        bool paused = false;
         std::exception_ptr exc;
         std::string data;
-        std::condition_variable avail, request;
+        std::condition_variable avail;
     };
 
     auto _state = std::make_shared<Sync<State>>();
@@ -1276,41 +1285,24 @@ void FileTransfer::download(
     Finally finally([&]() {
         auto state(_state->lock());
         state->quit = true;
-        state->request.notify_one();
     });
 
-    request.dataCallback = [_state, uri = request.uri.to_string()](std::string_view data) -> PauseTransfer {
+    request.dataCallback = [_state](std::string_view data) -> PauseTransfer {
         auto state(_state->lock());
 
         if (state->quit)
             return PauseTransfer::No;
 
         /* Append data to the buffer and wake up the calling
-           thread. */
+           thread. Never pause — let the buffer grow so curl
+           runs at full speed without TCP window collapse. */
         state->data.append(data);
         state->avail.notify_one();
 
-        if (state->data.size() <= fileTransferSettings.downloadBufferSize)
-            return PauseTransfer::No;
-
-        /* dataCallback gets called multiple times by an intermediate sink. Only
-           issue the debug message the first time around. */
-        if (!state->paused)
-            debug(
-                "pausing transfer for '%s': download buffer is full (%d > %d)",
-                uri,
-                state->data.size(),
-                fileTransferSettings.downloadBufferSize);
-
-        state->paused = true;
-
-        /* Technically the buffer might become larger than
-           downloadBufferSize, but with sinks there's no way to avoid
-           consuming data. */
-        return PauseTransfer::Yes;
+        return PauseTransfer::No;
     };
 
-    auto handle = enqueueFileTransfer(
+    enqueueFileTransfer(
         request, {[_state, resultCallback{std::move(resultCallback)}](std::future<FileTransferResult> fut) {
             auto state(_state->lock());
             state->quit = true;
@@ -1322,7 +1314,6 @@ void FileTransfer::download(
                 state->exc = std::current_exception();
             }
             state->avail.notify_one();
-            state->request.notify_one();
         }});
 
     while (true) {
@@ -1343,10 +1334,6 @@ void FileTransfer::download(
                     return;
                 }
 
-                if (state->paused) {
-                    unpauseTransfer(handle);
-                    state->paused = false;
-                }
                 state.wait(state->avail);
 
                 if (state->data.empty())
@@ -1356,12 +1343,9 @@ void FileTransfer::download(
             chunk = std::move(state->data);
             /* Reset state->data after the move, since we check data.empty() */
             state->data = "";
-
-            state->request.notify_one();
         }
 
-        /* Flush the data to the sink and wake up the download thread
-           if it's blocked on a full buffer. We don't hold the state
+        /* Flush the data to the sink. We don't hold the state
            lock while doing this to prevent blocking the download
            thread if sink() takes a long time. */
         sink(chunk);

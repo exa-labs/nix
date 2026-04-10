@@ -274,7 +274,20 @@ void HttpBinaryCacheStore::getFile(const std::string & path, Sink & sink)
     checkEnabled();
     auto request(makeRequest(path));
     try {
-        fileTransfer->download(std::move(request), sink);
+        /* Download the entire file before writing to the sink.
+           The streaming path (fileTransfer->download(request, sink)) uses
+           curl_easy_pause() when the sink can't keep up, which collapses
+           the TCP receive window and throttles throughput — even on HTTP/1.1.
+           For large NARs (hundreds of MB) where the sink does decompression
+           and store imports, this causes 60x slower effective throughput
+           (e.g. 5 MB/s effective vs 300+ MB/s burst).
+
+           By downloading fully first, curl runs at wire speed without any
+           pause/unpause cycles. The trade-off is higher peak memory usage
+           (one full NAR per concurrent download), which matches the behavior
+           of S3BinaryCacheStore. */
+        auto result = fileTransfer->download(std::move(request));
+        sink(result.data);
     } catch (FileTransferError & e) {
         if (e.error == FileTransfer::NotFound || e.error == FileTransfer::Forbidden)
             throw NoSuchBinaryCacheFile(
