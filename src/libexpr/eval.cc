@@ -302,6 +302,7 @@ EvalState::EvalState(
     , trylevel(0)
     , srcToStore(make_ref<decltype(srcToStore)::element_type>())
     , storeToSrc(make_ref<decltype(storeToSrc)::element_type>())
+    , evalTimeFiles(make_ref<decltype(evalTimeFiles)::element_type>())
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
@@ -1126,6 +1127,8 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         importResolutionCache->emplace(path, *resolvedPath);
     }
 
+    recordEvalTimeFile(*resolvedPath);
+
     if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
         forceValue(**v2, noPos);
         v = **v2;
@@ -1160,6 +1163,7 @@ void EvalState::resetFileCache()
     fileEvalCache->clear();
     inputCache->clear();
     positions.clear();
+    evalTimeFiles->clear();
 }
 
 void EvalState::eval(Expr * e, Value & v)
@@ -2686,6 +2690,20 @@ std::optional<std::filesystem::path> EvalState::getOriginalPath(const StorePath 
     if (it != sourceStoreToOriginalPath.end())
         return it->second;
     return std::nullopt;
+}
+
+void EvalState::recordEvalTimeFile(const SourcePath & path)
+{
+    evalTimeFiles->try_emplace(path, true);
+}
+
+std::vector<SourcePath> EvalState::getEvalTimeFiles() const
+{
+    std::vector<SourcePath> result;
+    evalTimeFiles->cvisit_all([&](const auto & entry) {
+        result.push_back(entry.first);
+    });
+    return result;
 }
 
 SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
