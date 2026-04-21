@@ -195,12 +195,18 @@ struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
                                 auto dir = dirs.front();
                                 dirs.pop();
                                 for (auto & de : fs::directory_iterator(dir)) {
-                                    if (de.is_directory()) {
+                                    // Skip symlinks to avoid infinite loops on
+                                    // cyclic links (e.g. `link -> .`) and to
+                                    // avoid enumerating files outside the store
+                                    // path via symlinks to external directories.
+                                    if (de.is_symlink()) {
+                                        auto relPath = fs::relative(de.path(), sp);
+                                        auto origFile = sourceRoot / relPath;
+                                        filesArr.push_back(origFile.string());
+                                    } else if (de.is_directory()) {
                                         dirs.push(de.path());
                                     } else {
-                                        // Get path relative to store root
                                         auto relPath = fs::relative(de.path(), sp);
-                                        // Map back to original source location
                                         auto origFile = sourceRoot / relPath;
                                         filesArr.push_back(origFile.string());
                                     }
