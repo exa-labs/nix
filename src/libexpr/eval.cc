@@ -1163,6 +1163,7 @@ void EvalState::resetFileCache()
     fileEvalCache->clear();
     inputCache->clear();
     positions.clear();
+    evalTimeFiles->clear();
 }
 
 void EvalState::eval(Expr * e, Value & v)
