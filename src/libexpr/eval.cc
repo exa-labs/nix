@@ -2612,28 +2612,16 @@ void EvalState::recordPathOrigin(const StorePath & storePath, const SourcePath &
             snapshot.emplace_back(entry.first, entry.second);
         });
 
-        // If there's exactly one source store path with an original path
-        // mapping, use it (common case: single flake with one source tree).
-        // If there are multiple, we can't disambiguate — try mount matching.
-        if (snapshot.size() == 1) {
-            sourceStoreToOriginalPath->try_emplace(storePath, snapshot.front().second);
-            return;
-        }
-
-        // Multiple source store paths — try to find the one that has a
-        // mount in storeFS by checking if the mount accessor matches
-        // srcPath's content fingerprint.
+        // Find the registered source whose storeFS mount matches srcPath's
+        // accessor identity, and map to that source's original path. No
+        // size-based shortcut — unrelated root-path SourcePaths must not be
+        // silently attributed to an arbitrary registered source.
         for (auto & [srcStorePath, origPath] : snapshot) {
             auto mountPath = CanonPath(store->printStorePath(srcStorePath));
             auto mount = storeFS->getMount(mountPath);
-            if (mount) {
-                // Check if the srcPath's accessor delegates to this mount.
-                // We verify by checking if the mount's accessor has the
-                // same originalRootPath as the origPath we expect.
-                if (mount->originalRootPath && *mount->originalRootPath == origPath) {
-                    sourceStoreToOriginalPath->try_emplace(storePath, origPath);
-                    return;
-                }
+            if (mount && mount->originalRootPath && *mount->originalRootPath == origPath) {
+                sourceStoreToOriginalPath->try_emplace(storePath, origPath);
+                return;
             }
         }
     }
