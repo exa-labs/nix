@@ -10,6 +10,7 @@
 #include "nix/store/derivations.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/fetchers/filtering-source-accessor.hh"
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <queue>
@@ -237,6 +238,13 @@ struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
      * Resolve a SourcePath from eval-time tracking back to the original
      * filesystem path, using the same strategies as resolveOriginalPath.
      */
+    /**
+     * Resolve a SourcePath from eval-time tracking back to the original
+     * filesystem path.  Extends resolveOriginalPath with accessor-chain
+     * walking: git+file:// paths go through a FilteringSourceAccessor
+     * (export-ignore) that wraps the git accessor.  The wrapper doesn't
+     * carry originalRootPath, but the inner accessor does.
+     */
     std::optional<std::string> resolveEvalTimePath(
         ref<Store> store, ref<EvalState> state, const SourcePath & srcPath)
     {
@@ -247,6 +255,23 @@ struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
         auto physPath = srcPath.getPhysicalPath();
         if (physPath)
             return physPath->string();
+
+        // Walk the accessor chain through FilteringSourceAccessor wrappers
+        // to find an inner accessor with originalRootPath set (e.g. the
+        // git accessor for git+file:// inputs).
+        SourceAccessor * cur = &*srcPath.accessor;
+        CanonPath curPath = srcPath.path;
+        while (auto * fa = dynamic_cast<FilteringSourceAccessor *>(cur)) {
+            curPath = fa->prefix / curPath;
+            cur = &*fa->next;
+            if (cur->originalRootPath) {
+                auto origRoot = *cur->originalRootPath;
+                auto relPath = curPath.rel();
+                if (relPath.empty() || relPath == ".")
+                    return origRoot.string();
+                return (origRoot / relPath).string();
+            }
+        }
 
         return std::nullopt;
     }
