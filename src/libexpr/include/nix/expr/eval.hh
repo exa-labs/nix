@@ -472,6 +472,10 @@ private:
        Populated by mountInput() for path: inputs. */
     std::map<StorePath, std::filesystem::path> sourceStoreToOriginalPath;
 
+    /* Paths read during evaluation (import, readFile, readDir, pathExists).
+       These are eval-time dependencies not captured by inputSrcs. */
+    const ref<boost::concurrent_flat_map<SourcePath, bool>> evalTimeFiles;
+
     /**
      * A cache that maps paths to "resolved" paths for importing Nix
      * expressions, i.e. `/foo` to `/foo/default.nix`.
@@ -605,6 +609,18 @@ public:
      * also appear in the storeToSrc provenance map.
      */
     void recordPathOrigin(const StorePath & storePath, const SourcePath & srcPath);
+
+    /**
+     * Record a file read during evaluation (import, readFile, readDir,
+     * pathExists).  These are eval-time dependencies not captured by
+     * derivation inputSrcs.
+     */
+    void recordEvalTimeFile(const SourcePath & path);
+
+    /**
+     * Return all paths read during evaluation.
+     */
+    std::vector<SourcePath> getEvalTimeFiles() const;
 
     void checkURI(const std::string & uri);
 

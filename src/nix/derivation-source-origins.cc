@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <queue>
+#include <set>
 
 using namespace nix;
 using json = nlohmann::json;
@@ -225,7 +226,48 @@ struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
             jsonRoot[store->printStorePath(drvPath)] = drvJson;
         }
 
+        // Step 4: Collect eval-time file reads (import, readFile, readDir,
+        // pathExists) — dependencies invisible to the inputSrcs graph.
+        jsonRoot["evalFiles"] = collectEvalFiles(store, state);
+
         printJSON(jsonRoot);
+    }
+
+    /**
+     * Resolve a SourcePath from eval-time tracking back to the original
+     * filesystem path, using the same strategies as resolveOriginalPath.
+     */
+    std::optional<std::string> resolveEvalTimePath(
+        ref<Store> store, ref<EvalState> state, const SourcePath & srcPath)
+    {
+        auto resolved = resolveOriginalPath(store, state, srcPath);
+        if (resolved)
+            return resolved;
+
+        auto physPath = srcPath.getPhysicalPath();
+        if (physPath)
+            return physPath->string();
+
+        return std::nullopt;
+    }
+
+    /**
+     * Collect eval-time file reads into a JSON array of resolved
+     * filesystem paths.  These are files accessed via import, readFile,
+     * readDir, or pathExists during evaluation — dependencies invisible
+     * to the derivation inputSrcs graph.
+     */
+    json collectEvalFiles(ref<Store> store, ref<EvalState> state)
+    {
+        json arr = json::array();
+        std::set<std::string> seen;
+        auto evalFiles = state->getEvalTimeFiles();
+        for (auto & srcPath : evalFiles) {
+            auto resolved = resolveEvalTimePath(store, state, srcPath);
+            if (resolved && seen.insert(*resolved).second)
+                arr.push_back(*resolved);
+        }
+        return arr;
     }
 };
 
