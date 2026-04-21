@@ -481,6 +481,15 @@ private:
        paths. */
     const ref<boost::concurrent_flat_map<SourcePath, StorePath>> srcToStore;
 
+    /* Reverse mapping: store paths back to their original source paths.
+       Populated alongside srcToStore so we can recover provenance. */
+    const ref<boost::concurrent_flat_map<StorePath, SourcePath>> storeToSrc;
+
+    /* Map from flake source store paths (e.g. /nix/store/xxx-source) to
+       their original filesystem paths (e.g. /home/user/project).
+       Populated by mountInput() for path: inputs. */
+    const ref<boost::concurrent_flat_map<StorePath, std::filesystem::path>> sourceStoreToOriginalPath;
+
     /**
      * A cache that maps paths to "resolved" paths for importing Nix
      * expressions, i.e. `/foo` to `/foo/default.nix`.
@@ -588,6 +597,32 @@ public:
      * Allow access to a store path and return it as a string.
      */
     void allowAndSetStorePathString(const StorePath & storePath, Value & v);
+
+    /**
+     * Look up the original source path for a store path that was
+     * copied into the store during this evaluation.  Returns
+     * std::nullopt when the store path wasn't produced by this
+     * evaluator (e.g. it came from a substituter).
+     */
+    std::optional<SourcePath> getSourceOrigin(const StorePath & storePath) const;
+
+    /**
+     * Return the full store→source mapping built during this evaluation.
+     */
+    std::map<StorePath, SourcePath> getSourceOrigins() const;
+
+    /**
+     * Look up the original filesystem path for a flake source store path.
+     * Returns std::nullopt if the store path wasn't a path: input.
+     */
+    std::optional<std::filesystem::path> getOriginalPath(const StorePath & storePath) const;
+
+    /**
+     * Record a store path → source path mapping. Used by addPath
+     * (builtins.path / builtins.filterSource) so that filtered sources
+     * also appear in the storeToSrc provenance map.
+     */
+    void recordPathOrigin(const StorePath & storePath, const SourcePath & srcPath);
 
     void checkURI(const std::string & uri);
 

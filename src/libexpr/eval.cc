@@ -329,6 +329,8 @@ EvalState::EvalState(
     , trylevel(0)
     , asyncPathWriter(AsyncPathWriter::make(store))
     , srcToStore(make_ref<decltype(srcToStore)::element_type>())
+    , storeToSrc(make_ref<decltype(storeToSrc)::element_type>())
+    , sourceStoreToOriginalPath(make_ref<decltype(sourceStoreToOriginalPath)::element_type>())
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
@@ -2529,12 +2531,105 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
             repair);
         allowPath(dstPath);
         srcToStore->try_emplace(path, dstPath);
+        storeToSrc->try_emplace(dstPath, path);
         printMsg(lvlChatty, "copied source '%1%' -> '%2%'", path, store->printStorePath(dstPath));
         return dstPath;
     }();
 
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
     return dstPath;
+}
+
+std::optional<SourcePath> EvalState::getSourceOrigin(const StorePath & storePath) const
+{
+    auto result = getConcurrent(*storeToSrc, storePath);
+    if (result)
+        return *result;
+    return std::nullopt;
+}
+
+std::map<StorePath, SourcePath> EvalState::getSourceOrigins() const
+{
+    std::map<StorePath, SourcePath> result;
+    storeToSrc->cvisit_all([&](const auto & entry) {
+        result.emplace(entry.first, entry.second);
+    });
+    return result;
+}
+
+void EvalState::recordPathOrigin(const StorePath & storePath, const SourcePath & srcPath)
+{
+    storeToSrc->try_emplace(storePath, srcPath);
+
+    // Try to directly resolve the original filesystem path so that
+    // source-origins can map this store path back without needing to
+    // trace through accessor chains.
+
+    auto pathStr = srcPath.path.abs();
+    auto storeDirStr = store->storeDir;
+
+    // Strategy 1: the SourcePath's canonical path starts with /nix/store/.
+    // Parse the store path prefix and look it up in sourceStoreToOriginalPath.
+    if (hasPrefix(pathStr, storeDirStr + "/")) {
+        auto afterStore = pathStr.find('/', storeDirStr.size() + 1);
+        std::string storePathStr = (afterStore == std::string::npos)
+            ? pathStr : pathStr.substr(0, afterStore);
+        try {
+            auto sp = store->parseStorePath(storePathStr);
+            if (auto origRoot = getConcurrent(*sourceStoreToOriginalPath, sp)) {
+                auto relPath = (afterStore == std::string::npos)
+                    ? "" : pathStr.substr(afterStore + 1);
+                auto origPath = relPath.empty()
+                    ? *origRoot : (*origRoot / relPath);
+                sourceStoreToOriginalPath->try_emplace(storePath, origPath);
+                return;
+            }
+        } catch (...) {}
+    }
+
+    // Strategy 2: the accessor has originalRootPath set directly
+    // (per-input accessor from mountInput).
+    if (srcPath.accessor->originalRootPath) {
+        auto relPath = srcPath.path.rel();
+        auto origRoot = *srcPath.accessor->originalRootPath;
+        auto origPath = (relPath.empty() || relPath == ".")
+            ? origRoot : (origRoot / relPath);
+        sourceStoreToOriginalPath->try_emplace(storePath, origPath);
+        return;
+    }
+
+    // Strategy 3: the SourcePath is {rootFS, /} which means it accesses
+    // the root of a source tree mounted in storeFS. This happens with
+    // cleanSourceWith / builtins.path when the path expression resolves
+    // to the root of a per-input accessor. Use the storeFS to find which
+    // mount covers this path by checking each known source store path.
+    if (srcPath.path.isRoot()) {
+        // Snapshot entries into a local vector so we can iterate without
+        // holding a lock on the concurrent map while calling try_emplace
+        // (which would deadlock or violate cvisit_all's shared-lock contract).
+        std::vector<std::pair<StorePath, std::filesystem::path>> snapshot;
+        sourceStoreToOriginalPath->cvisit_all([&](const auto & entry) {
+            snapshot.emplace_back(entry.first, entry.second);
+        });
+
+        // Find the registered source whose storeFS mount matches srcPath's
+        // accessor identity, and map to that source's original path. No
+        // size-based shortcut — unrelated root-path SourcePaths must not be
+        // silently attributed to an arbitrary registered source.
+        for (auto & [srcStorePath, origPath] : snapshot) {
+            auto mountPath = CanonPath(store->printStorePath(srcStorePath));
+            auto mount = storeFS->getMount(mountPath);
+            if (mount && mount->originalRootPath && *mount->originalRootPath == origPath) {
+                sourceStoreToOriginalPath->try_emplace(storePath, origPath);
+                return;
+            }
+        }
+    }
+}
+
+std::optional<std::filesystem::path> EvalState::getOriginalPath(const StorePath & storePath) const
+{
+    return getConcurrent(*sourceStoreToOriginalPath, storePath);
 }
 
 SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
