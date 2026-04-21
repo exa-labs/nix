@@ -488,7 +488,7 @@ private:
     /* Map from flake source store paths (e.g. /nix/store/xxx-source) to
        their original filesystem paths (e.g. /home/user/project).
        Populated by mountInput() for path: inputs. */
-    std::map<StorePath, std::filesystem::path> sourceStoreToOriginalPath;
+    const ref<boost::concurrent_flat_map<StorePath, std::filesystem::path>> sourceStoreToOriginalPath;
 
     /**
      * A cache that maps paths to "resolved" paths for importing Nix

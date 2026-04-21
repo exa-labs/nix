@@ -111,9 +111,9 @@ StorePath EvalState::mountInput(
     // to the source tree root) over input.getSourcePath() (which returns
     // the flake directory, not the git root for git-tracked flakes).
     if (accessor->originalRootPath) {
-        sourceStoreToOriginalPath.try_emplace(storePath, *accessor->originalRootPath);
+        sourceStoreToOriginalPath->try_emplace(storePath, *accessor->originalRootPath);
     } else if (auto origPath = input.getSourcePath()) {
-        sourceStoreToOriginalPath.try_emplace(storePath, *origPath);
+        sourceStoreToOriginalPath->try_emplace(storePath, *origPath);
         accessor->originalRootPath = *origPath;
     }
 

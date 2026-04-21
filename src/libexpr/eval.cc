@@ -330,6 +330,7 @@ EvalState::EvalState(
     , asyncPathWriter(AsyncPathWriter::make(store))
     , srcToStore(make_ref<decltype(srcToStore)::element_type>())
     , storeToSrc(make_ref<decltype(storeToSrc)::element_type>())
+    , sourceStoreToOriginalPath(make_ref<decltype(sourceStoreToOriginalPath)::element_type>())
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
@@ -2575,13 +2576,12 @@ void EvalState::recordPathOrigin(const StorePath & storePath, const SourcePath &
             ? pathStr : pathStr.substr(0, afterStore);
         try {
             auto sp = store->parseStorePath(storePathStr);
-            auto it = sourceStoreToOriginalPath.find(sp);
-            if (it != sourceStoreToOriginalPath.end()) {
+            if (auto origRoot = getConcurrent(*sourceStoreToOriginalPath, sp)) {
                 auto relPath = (afterStore == std::string::npos)
                     ? "" : pathStr.substr(afterStore + 1);
                 auto origPath = relPath.empty()
-                    ? it->second : (it->second / relPath);
-                sourceStoreToOriginalPath.try_emplace(storePath, origPath);
+                    ? *origRoot : (*origRoot / relPath);
+                sourceStoreToOriginalPath->try_emplace(storePath, origPath);
                 return;
             }
         } catch (...) {}
@@ -2594,7 +2594,7 @@ void EvalState::recordPathOrigin(const StorePath & storePath, const SourcePath &
         auto origRoot = *srcPath.accessor->originalRootPath;
         auto origPath = (relPath.empty() || relPath == ".")
             ? origRoot : (origRoot / relPath);
-        sourceStoreToOriginalPath.try_emplace(storePath, origPath);
+        sourceStoreToOriginalPath->try_emplace(storePath, origPath);
         return;
     }
 
@@ -2604,19 +2604,26 @@ void EvalState::recordPathOrigin(const StorePath & storePath, const SourcePath &
     // to the root of a per-input accessor. Use the storeFS to find which
     // mount covers this path by checking each known source store path.
     if (srcPath.path.isRoot()) {
+        // Snapshot entries into a local vector so we can iterate without
+        // holding a lock on the concurrent map while calling try_emplace
+        // (which would deadlock or violate cvisit_all's shared-lock contract).
+        std::vector<std::pair<StorePath, std::filesystem::path>> snapshot;
+        sourceStoreToOriginalPath->cvisit_all([&](const auto & entry) {
+            snapshot.emplace_back(entry.first, entry.second);
+        });
+
         // If there's exactly one source store path with an original path
         // mapping, use it (common case: single flake with one source tree).
-        // If there are multiple, we can't disambiguate — skip.
-        if (sourceStoreToOriginalPath.size() == 1) {
-            auto & [srcStorePath, origPath] = *sourceStoreToOriginalPath.begin();
-            sourceStoreToOriginalPath.try_emplace(storePath, origPath);
+        // If there are multiple, we can't disambiguate — try mount matching.
+        if (snapshot.size() == 1) {
+            sourceStoreToOriginalPath->try_emplace(storePath, snapshot.front().second);
             return;
         }
 
         // Multiple source store paths — try to find the one that has a
         // mount in storeFS by checking if the mount accessor matches
         // srcPath's content fingerprint.
-        for (auto & [srcStorePath, origPath] : sourceStoreToOriginalPath) {
+        for (auto & [srcStorePath, origPath] : snapshot) {
             auto mountPath = CanonPath(store->printStorePath(srcStorePath));
             auto mount = storeFS->getMount(mountPath);
             if (mount) {
@@ -2624,7 +2631,7 @@ void EvalState::recordPathOrigin(const StorePath & storePath, const SourcePath &
                 // We verify by checking if the mount's accessor has the
                 // same originalRootPath as the origPath we expect.
                 if (mount->originalRootPath && *mount->originalRootPath == origPath) {
-                    sourceStoreToOriginalPath.try_emplace(storePath, origPath);
+                    sourceStoreToOriginalPath->try_emplace(storePath, origPath);
                     return;
                 }
             }
@@ -2634,10 +2641,7 @@ void EvalState::recordPathOrigin(const StorePath & storePath, const SourcePath &
 
 std::optional<std::filesystem::path> EvalState::getOriginalPath(const StorePath & storePath) const
 {
-    auto it = sourceStoreToOriginalPath.find(storePath);
-    if (it != sourceStoreToOriginalPath.end())
-        return it->second;
-    return std::nullopt;
+    return getConcurrent(*sourceStoreToOriginalPath, storePath);
 }
 
 SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
