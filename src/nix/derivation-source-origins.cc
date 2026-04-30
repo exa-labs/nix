@@ -10,9 +10,11 @@
 #include "nix/store/derivations.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/fetchers/filtering-source-accessor.hh"
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <queue>
+#include <set>
 
 using namespace nix;
 using json = nlohmann::json;
@@ -115,10 +117,11 @@ struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
         // stays empty.
         evalSettings.useEvalCache = false;
 
-        // Step 1: Evaluate installables to derivation paths.
-        // This triggers copyPathToStore for every source reference in the
-        // Nix expressions, populating EvalState::storeToSrc.
-        auto drvPaths = Installable::toDerivations(store, installables, true);
+        auto state = getEvalState();
+        auto installableEvalFiles = Installable::toDerivationsWithEvalFiles(state, store, installables, true);
+        StorePathSet drvPaths;
+        for (auto & [drvPath, _] : installableEvalFiles)
+            drvPaths.insert(drvPath);
 
         if (recursive) {
             StorePathSet closure;
@@ -128,7 +131,6 @@ struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
 
         // Step 2: Grab the full store→source mapping that was built during
         // evaluation, plus the sourceStoreToOriginalPath mapping from mountInput.
-        auto state = getEvalState();
         auto origins = state->getSourceOrigins();
 
         // Step 3: For each derivation, read its inputSrcs and look up
@@ -228,10 +230,78 @@ struct CmdDerivationSourceOrigins : InstallablesCommand, MixPrintJSON
             drvJson["drvPath"] = store->printStorePath(drvPath);
             drvJson["name"] = drv.name;
             drvJson["inputSrcs"] = inputSrcsJson;
+            auto evalFiles = installableEvalFiles.find(drvPath);
+            if (evalFiles != installableEvalFiles.end())
+                drvJson["evalFiles"] = collectEvalFiles(store, state, evalFiles->second);
             jsonRoot[store->printStorePath(drvPath)] = drvJson;
         }
 
+        // Step 4: Collect eval-time file reads (import, readFile, readDir,
+        // pathExists) — dependencies invisible to the inputSrcs graph.
+        jsonRoot["evalFiles"] = collectEvalFiles(store, state, state->getEvalTimeFiles());
+
         printJSON(jsonRoot);
+    }
+
+    /**
+     * Resolve a SourcePath from eval-time tracking back to the original
+     * filesystem path.  Extends resolveOriginalPath with accessor-chain
+     * walking: git+file:// paths go through a FilteringSourceAccessor
+     * (export-ignore) that wraps the git accessor.  The wrapper doesn't
+     * carry originalRootPath, but the inner accessor does.
+     */
+    std::optional<std::string> resolveEvalTimePath(
+        ref<Store> store, ref<EvalState> state, const SourcePath & srcPath)
+    {
+        auto resolved = resolveOriginalPath(store, state, srcPath);
+        if (resolved)
+            return resolved;
+
+        auto physPath = srcPath.getPhysicalPath();
+        if (physPath)
+            return physPath->string();
+
+        // Walk the accessor chain through FilteringSourceAccessor wrappers
+        // to find an inner accessor with originalRootPath set (e.g. the
+        // git accessor for git+file:// inputs).
+        SourceAccessor * cur = &*srcPath.accessor;
+        CanonPath curPath = srcPath.path;
+        while (auto * fa = dynamic_cast<FilteringSourceAccessor *>(cur)) {
+            curPath = fa->prefix / curPath;
+            cur = &*fa->next;
+            if (cur->originalRootPath) {
+                auto origRoot = *cur->originalRootPath;
+                auto relPath = curPath.rel();
+                if (relPath.empty() || relPath == ".")
+                    return origRoot.string();
+                return (origRoot / relPath).string();
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    /**
+     * Collect eval-time file reads into a JSON array of resolved
+     * filesystem paths.  These are files accessed via import, readFile,
+     * readDir, or pathExists during evaluation — dependencies invisible
+     * to the derivation inputSrcs graph.
+     */
+    json collectEvalFiles(ref<Store> store, ref<EvalState> state, const std::vector<SourcePath> & evalFiles)
+    {
+        json arr = json::array();
+        std::set<std::string> seen;
+        for (auto & srcPath : evalFiles) {
+            auto resolved = resolveEvalTimePath(store, state, srcPath);
+            if (resolved && seen.insert(*resolved).second)
+                arr.push_back(*resolved);
+        }
+        return arr;
+    }
+
+    json collectEvalFiles(ref<Store> store, ref<EvalState> state, const std::set<SourcePath> & evalFiles)
+    {
+        return collectEvalFiles(store, state, std::vector<SourcePath>(evalFiles.begin(), evalFiles.end()));
     }
 };
 

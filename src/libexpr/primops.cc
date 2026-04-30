@@ -2042,6 +2042,8 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value ** args, 
         auto symlinkResolution = mustBeDir ? SymlinkResolution::Full : SymlinkResolution::Ancestors;
         auto path = state.realisePath(pos, arg, symlinkResolution);
 
+        state.recordEvalTimeFile(path);
+
         auto st = path.maybeLstat();
         auto exists = st && (!mustBeDir || st->type == SourceAccessor::tDirectory);
         v.mkBool(exists);
@@ -2148,6 +2150,7 @@ static RegisterPrimOp primop_dirOf({
 static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto path = state.realisePath(pos, *args[0]);
+    state.recordEvalTimeFile(path);
     auto s = path.readFile();
     if (s.find((char) 0) != std::string::npos)
         state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
@@ -2386,6 +2389,7 @@ static void prim_hashFile(EvalState & state, const PosIdx pos, Value ** args, Va
         state.error<EvalError>("unknown hash algorithm '%1%'", algo).atPos(pos).debugThrow();
 
     auto path = state.realisePath(pos, *args[1]);
+    state.recordEvalTimeFile(path);
 
     v.mkString(hashString(*ha, path.readFile()).to_string(HashFormat::Base16, false), state.mem);
 }
@@ -2455,6 +2459,7 @@ static const Value & fileTypeToString(EvalState & state, SourceAccessor::Type ty
 static void prim_readFileType(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto path = state.realisePath(pos, *args[0], std::nullopt);
+    state.recordEvalTimeFile(path);
     /* Retrieve the directory entry type and stringize it. */
     v = fileTypeToString(state, path.lstat().type);
 }
@@ -2473,6 +2478,7 @@ static RegisterPrimOp primop_readFileType({
 static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto path = state.realisePath(pos, *args[0]);
+    state.recordEvalTimeFile(path);
 
     // Retrieve directory entries for all nodes in a directory.
     // This is similar to `getFileType` but is optimized to reduce system calls

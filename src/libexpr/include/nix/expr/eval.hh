@@ -16,6 +16,7 @@
 #include "nix/expr/search-path.hh"
 #include "nix/expr/repl-exit-status.hh"
 #include "nix/util/ref.hh"
+#include "nix/util/sync.hh"
 #include "nix/expr/counter.hh"
 
 // For `NIX_USE_BOEHMGC`, and if that's set, `GC_THREADS`
@@ -27,6 +28,7 @@
 #include <map>
 #include <optional>
 #include <functional>
+#include <set>
 
 namespace nix {
 
@@ -490,6 +492,17 @@ private:
        Populated by mountInput() for path: inputs. */
     const ref<boost::concurrent_flat_map<StorePath, std::filesystem::path>> sourceStoreToOriginalPath;
 
+    /* Paths read during evaluation (import, readFile, readDir, pathExists).
+       These are eval-time dependencies not captured by inputSrcs. */
+    const ref<boost::concurrent_flat_map<SourcePath, bool>> evalTimeFiles;
+
+    struct InstallableEvalFiles
+    {
+        std::map<StorePath, std::set<SourcePath>> byDrvPath;
+    };
+
+    const ref<Sync<InstallableEvalFiles>> installableEvalFiles;
+
     /**
      * A cache that maps paths to "resolved" paths for importing Nix
      * expressions, i.e. `/foo` to `/foo/default.nix`.
@@ -623,6 +636,20 @@ public:
      * also appear in the storeToSrc provenance map.
      */
     void recordPathOrigin(const StorePath & storePath, const SourcePath & srcPath);
+
+    /**
+     * Record a file read during evaluation (import, readFile, readDir,
+     * pathExists).  These are eval-time dependencies not captured by
+     * derivation inputSrcs.
+     */
+    void recordEvalTimeFile(const SourcePath & path);
+
+    /**
+     * Return all paths read during evaluation.
+     */
+    std::vector<SourcePath> getEvalTimeFiles() const;
+
+    void addInstallableEvalFiles(const StorePath & drvPath, const std::set<SourcePath> & paths);
 
     void checkURI(const std::string & uri);
 
@@ -1172,6 +1199,7 @@ public:
     struct EvalContext
     {
         std::shared_ptr<const Provenance> provenance;
+        std::shared_ptr<Sync<std::set<SourcePath>>> evalTimeFiles;
     };
 
     thread_local static EvalContext evalContext;
@@ -1263,6 +1291,24 @@ struct PushProvenance
     ~PushProvenance()
     {
         state.evalContext.provenance.swap(prev);
+    }
+};
+
+struct PushEvalTimeFiles
+{
+    EvalState & state;
+    std::shared_ptr<Sync<std::set<SourcePath>>> prev;
+
+    PushEvalTimeFiles(EvalState & state, std::shared_ptr<Sync<std::set<SourcePath>>> paths)
+        : state(state)
+    {
+        state.evalContext.evalTimeFiles.swap(prev);
+        state.evalContext.evalTimeFiles.swap(paths);
+    }
+
+    ~PushEvalTimeFiles()
+    {
+        state.evalContext.evalTimeFiles.swap(prev);
     }
 };
 

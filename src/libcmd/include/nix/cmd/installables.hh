@@ -8,11 +8,15 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/build-result.hh"
 
+#include <map>
 #include <optional>
+#include <set>
 
 namespace nix {
 
 struct PackageInfo;
+struct SourcePath;
+class EvalState;
 
 enum class Realise {
     /**
@@ -196,6 +200,10 @@ struct Installable
 
     static std::set<StorePath>
     toDerivations(ref<Store> store, const Installables & installables, bool useDeriver = false);
+
+    static std::map<StorePath, std::set<SourcePath>>
+    toDerivationsWithEvalFiles(
+        ref<EvalState> evalState, ref<Store> store, const Installables & installables, bool useDeriver = false);
 
     static BuiltPaths toBuiltPaths(
         ref<Store> evalStore, ref<Store> store, Realise mode, OperateOn operateOn, const Installables & installables);

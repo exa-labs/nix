@@ -25,10 +25,12 @@
 
 #include <regex>
 #include <queue>
+#include <set>
 
 #include <nlohmann/json.hpp>
 
 #include "nix/util/strings-inline.hh"
+
 
 namespace nix {
 
@@ -731,6 +733,41 @@ StorePathSet Installable::toDerivations(ref<Store> store, const Installables & i
                 b.path.raw());
 
     return drvPaths;
+}
+
+std::map<StorePath, std::set<SourcePath>>
+Installable::toDerivationsWithEvalFiles(
+    ref<EvalState> evalState, ref<Store> store, const Installables & installables, bool useDeriver)
+{
+    std::map<StorePath, std::set<SourcePath>> result;
+
+    for (const auto & i : installables) {
+        auto files = make_ref<Sync<std::set<SourcePath>>>();
+        PushEvalTimeFiles pushedEvalTimeFiles(*evalState, files);
+
+        StorePathSet drvPaths;
+        for (const auto & b : i->toDerivedPaths())
+            std::visit(
+                overloaded{
+                    [&](const DerivedPath::Opaque & bo) {
+                        drvPaths.insert(
+                            bo.path.isDerivation() ? bo.path
+                            : useDeriver           ? getDeriver(store, *i, bo.path)
+                                         : throw Error("argument '%s' did not evaluate to a derivation", i->what()));
+                    },
+                    [&](const DerivedPath::Built & bfd) { drvPaths.insert(resolveDerivedPath(*store, *bfd.drvPath)); },
+                },
+                b.path.raw());
+
+        auto recorded = files->lock();
+
+        for (auto & drvPath : drvPaths) {
+            result[drvPath].insert(recorded->begin(), recorded->end());
+            evalState->addInstallableEvalFiles(drvPath, *recorded);
+        }
+    }
+
+    return result;
 }
 
 RawInstallablesCommand::RawInstallablesCommand()
