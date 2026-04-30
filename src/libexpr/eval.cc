@@ -331,6 +331,8 @@ EvalState::EvalState(
     , srcToStore(make_ref<decltype(srcToStore)::element_type>())
     , storeToSrc(make_ref<decltype(storeToSrc)::element_type>())
     , sourceStoreToOriginalPath(make_ref<decltype(sourceStoreToOriginalPath)::element_type>())
+    , evalTimeFiles(make_ref<decltype(evalTimeFiles)::element_type>())
+    , installableEvalFiles(make_ref<decltype(installableEvalFiles)::element_type>())
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
@@ -1156,6 +1158,8 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         importResolutionCache->emplace(path, *resolvedPath);
     }
 
+    recordEvalTimeFile(*resolvedPath);
+
     if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
         forceValue(**v2, noPos);
         v = **v2;
@@ -1186,6 +1190,8 @@ void EvalState::resetFileCache()
     fileEvalCache->clear();
     inputCache->clear();
     positions.clear();
+    evalTimeFiles->clear();
+    installableEvalFiles->lock()->byDrvPath.clear();
 }
 
 void EvalState::eval(Expr * e, Value & v)
@@ -2630,6 +2636,29 @@ void EvalState::recordPathOrigin(const StorePath & storePath, const SourcePath &
 std::optional<std::filesystem::path> EvalState::getOriginalPath(const StorePath & storePath) const
 {
     return getConcurrent(*sourceStoreToOriginalPath, storePath);
+}
+
+void EvalState::recordEvalTimeFile(const SourcePath & path)
+{
+    evalTimeFiles->try_emplace(path, true);
+    if (evalContext.evalTimeFiles)
+        evalContext.evalTimeFiles->lock()->insert(path);
+}
+
+std::vector<SourcePath> EvalState::getEvalTimeFiles() const
+{
+    std::vector<SourcePath> result;
+    evalTimeFiles->cvisit_all([&](const auto & entry) {
+        result.push_back(entry.first);
+    });
+    return result;
+}
+
+void EvalState::addInstallableEvalFiles(const StorePath & drvPath, const std::set<SourcePath> & paths)
+{
+    auto state = installableEvalFiles->lock();
+    auto & existing = state->byDrvPath[drvPath];
+    existing.insert(paths.begin(), paths.end());
 }
 
 SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
