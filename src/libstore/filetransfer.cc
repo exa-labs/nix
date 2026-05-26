@@ -3,6 +3,8 @@
 #include "nix/store/globals.hh"
 #include "nix/util/config-global.hh"
 #include "nix/store/store-api.hh"
+#include "nix/util/file-descriptor.hh"
+#include "nix/util/file-system.hh"
 #include "nix/util/finally.hh"
 #include "nix/util/callback.hh"
 #include "nix/util/signals.hh"
@@ -1260,12 +1262,30 @@ void FileTransfer::download(
        Therefore we use a buffer to communicate data between the
        download thread and the calling thread. */
 
+    /* Buffer between the download thread (libcurl write callback) and the
+       caller's sink. Bytes flow in FIFO order:
+
+         dataCallback (curl) ──> [in-memory `data`] ──> sink (consumer)
+
+       When `data` exceeds `download-buffer-size`, instead of pausing libcurl
+       (which triggers HTTP/2 head-of-line blocking by stalling the kernel
+       socket buffer and collapsing TCP rcv_wnd on the shared connection — see
+       SEV-508 / exa-labs/monorepo#43422), we spill the *overflow* to an
+       anonymous tempfile. The consumer drains `data` first (head of FIFO),
+       then reads the rest from `spillFd`.
+
+       Invariant: once any byte has been written to spillFd for this transfer,
+       all subsequent bytes also go to spillFd until spillFd is fully drained.
+       This preserves FIFO without interleaving memory and disk writes. */
     struct State
     {
         bool quit = false;
-        bool paused = false;
+        bool paused = false; /* fallback path if spill is unavailable */
         std::exception_ptr exc;
         std::string data;
+        AutoCloseFD spillFd;
+        off_t spillBytesWritten = 0;
+        off_t spillBytesRead = 0;
         std::condition_variable avail, request;
     };
 
@@ -1285,7 +1305,51 @@ void FileTransfer::download(
         if (state->quit)
             return PauseTransfer::No;
 
-        /* Append data to the buffer and wake up the calling
+        /* If we've already started spilling for this transfer, keep spilling
+           until the spill file is fully drained — switching back mid-stream
+           would reorder bytes. */
+        bool spillActive = state->spillBytesRead < state->spillBytesWritten;
+        bool memOverflow = state->data.size() + data.size() > fileTransferSettings.downloadBufferSize;
+
+        if (spillActive || memOverflow) {
+            /* Spill overflow to disk to avoid calling curl_easy_pause(),
+               which can stall co-multiplexed HTTP/2 streams on the same TCP
+               connection. Writes are positional (pwrite) so they don't
+               interfere with the consumer's pread offset. */
+            try {
+                if (!state->spillFd)
+                    state->spillFd = createAnonymousTempFile();
+                size_t remaining = data.size();
+                const char * buf = data.data();
+                off_t offset = state->spillBytesWritten;
+                while (remaining > 0) {
+                    ssize_t n = ::pwrite(state->spillFd.get(), buf, remaining, offset);
+                    if (n < 0) {
+                        if (errno == EINTR)
+                            continue;
+                        throw SysError("writing to download spill file");
+                    }
+                    if (n == 0)
+                        throw nix::Error("short pwrite to download spill file");
+                    buf += n;
+                    offset += n;
+                    remaining -= n;
+                }
+                state->spillBytesWritten = offset;
+                state->avail.notify_one();
+                return PauseTransfer::No;
+            } catch (SysError & e) {
+                /* Disk spill failed (out of space, fd limit, etc.). Fall through
+                   to the legacy pause-based backpressure. This is rare; we log
+                   so it shows up in nix-daemon logs. */
+                debug(
+                    "download spill failed for '%s' (%s); falling back to pause-based backpressure",
+                    uri,
+                    e.what());
+            }
+        }
+
+        /* Append data to the in-memory buffer and wake up the calling
            thread. */
         state->data.append(data);
         state->avail.notify_one();
@@ -1297,7 +1361,7 @@ void FileTransfer::download(
            issue the debug message the first time around. */
         if (!state->paused)
             debug(
-                "pausing transfer for '%s': download buffer is full (%d > %d)",
+                "pausing transfer for '%s': download buffer is full (%d > %d) and disk spill unavailable",
                 uri,
                 state->data.size(),
                 fileTransferSettings.downloadBufferSize);
@@ -1325,17 +1389,26 @@ void FileTransfer::download(
             state->request.notify_one();
         }});
 
+    /* Max bytes we'll read from the spill file in one go before flushing to
+       the sink. Keeps the consumer responsive and bounds peak transient memory. */
+    constexpr size_t spillReadChunkBytes = 4 * 1024 * 1024;
+
     while (true) {
         checkInterrupt();
 
         std::string chunk;
+        int spillFdToRead = -1;
+        off_t spillReadOffset = 0;
+        size_t spillReadSize = 0;
 
         /* Grab data if available, otherwise wait for the download
            thread to wake us up. */
         {
             auto state(_state->lock());
 
-            if (state->data.empty()) {
+            bool spillPending = state->spillBytesRead < state->spillBytesWritten;
+
+            if (state->data.empty() && !spillPending) {
 
                 if (state->quit) {
                     if (state->exc)
@@ -1349,15 +1422,48 @@ void FileTransfer::download(
                 }
                 state.wait(state->avail);
 
-                if (state->data.empty())
+                spillPending = state->spillBytesRead < state->spillBytesWritten;
+                if (state->data.empty() && !spillPending)
                     continue;
             }
 
-            chunk = std::move(state->data);
-            /* Reset state->data after the move, since we check data.empty() */
-            state->data = "";
+            if (!state->data.empty()) {
+                /* Drain the in-memory head of the FIFO first. */
+                chunk = std::move(state->data);
+                state->data = "";
+            } else {
+                /* Memory is empty; pull the next slice from the spill file.
+                   We record what to read here (under the lock) and do the
+                   actual pread outside the lock so the download thread isn't
+                   blocked on disk I/O. */
+                spillFdToRead = state->spillFd.get();
+                spillReadOffset = state->spillBytesRead;
+                spillReadSize = std::min<size_t>(
+                    state->spillBytesWritten - state->spillBytesRead, spillReadChunkBytes);
+                state->spillBytesRead += spillReadSize;
+            }
 
             state->request.notify_one();
+        }
+
+        if (spillFdToRead >= 0) {
+            /* pread is safe here: the writer (under State lock) only writes
+               at offsets >= spillBytesWritten, which is past our read range
+               [spillReadOffset, spillReadOffset+spillReadSize). */
+            chunk.resize(spillReadSize);
+            size_t got = 0;
+            while (got < spillReadSize) {
+                ssize_t n = ::pread(
+                    spillFdToRead, chunk.data() + got, spillReadSize - got, spillReadOffset + got);
+                if (n < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    throw SysError("reading from download spill file");
+                }
+                if (n == 0)
+                    throw nix::Error("unexpected EOF reading download spill file");
+                got += n;
+            }
         }
 
         /* Flush the data to the sink and wake up the download thread
