@@ -1342,10 +1342,7 @@ void FileTransfer::download(
                 /* Disk spill failed (out of space, fd limit, etc.). Fall through
                    to the legacy pause-based backpressure. This is rare; we log
                    so it shows up in nix-daemon logs. */
-                debug(
-                    "download spill failed for '%s' (%s); falling back to pause-based backpressure",
-                    uri,
-                    e.what());
+                debug("download spill failed for '%s' (%s); falling back to pause-based backpressure", uri, e.what());
             }
         }
 
@@ -1438,8 +1435,7 @@ void FileTransfer::download(
                    blocked on disk I/O. */
                 spillFdToRead = state->spillFd.get();
                 spillReadOffset = state->spillBytesRead;
-                spillReadSize = std::min<size_t>(
-                    state->spillBytesWritten - state->spillBytesRead, spillReadChunkBytes);
+                spillReadSize = std::min<size_t>(state->spillBytesWritten - state->spillBytesRead, spillReadChunkBytes);
                 state->spillBytesRead += spillReadSize;
             }
 
@@ -1453,8 +1449,7 @@ void FileTransfer::download(
             chunk.resize(spillReadSize);
             size_t got = 0;
             while (got < spillReadSize) {
-                ssize_t n = ::pread(
-                    spillFdToRead, chunk.data() + got, spillReadSize - got, spillReadOffset + got);
+                ssize_t n = ::pread(spillFdToRead, chunk.data() + got, spillReadSize - got, spillReadOffset + got);
                 if (n < 0) {
                     if (errno == EINTR)
                         continue;
