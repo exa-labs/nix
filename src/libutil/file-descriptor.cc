@@ -15,6 +15,8 @@
 
 namespace nix {
 
+void EndOfFile::anchor() {}
+
 namespace {
 
 enum class PollDirection { In, Out };
@@ -237,6 +239,7 @@ AutoCloseFD::AutoCloseFD(AutoCloseFD && that) noexcept
     that.fd = INVALID_DESCRIPTOR;
 }
 
+// NOLINTNEXTLINE(performance-noexcept-move-constructor) - technically can throw
 AutoCloseFD & AutoCloseFD::operator=(AutoCloseFD && that)
 {
     close();

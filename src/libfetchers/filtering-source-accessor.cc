@@ -62,11 +62,6 @@ std::pair<CanonPath, std::optional<std::string>> FilteringSourceAccessor::getFin
     return next->getFingerprint(prefix / path);
 }
 
-void FilteringSourceAccessor::invalidateCache(const CanonPath & path)
-{
-    next->invalidateCache(prefix / path);
-}
-
 void FilteringSourceAccessor::checkAccess(const CanonPath & path)
 {
     if (!isAllowed(path))
@@ -75,6 +70,9 @@ void FilteringSourceAccessor::checkAccess(const CanonPath & path)
 
 struct AllowListSourceAccessorImpl : AllowListSourceAccessor
 {
+private:
+    void anchor() override {};
+public:
     SharedSync<std::set<CanonPath>> allowedPrefixes;
     boost::concurrent_flat_set<CanonPath> allowedPaths;
 

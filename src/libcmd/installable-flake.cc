@@ -1,25 +1,14 @@
-#include "nix/store/globals.hh"
 #include "nix/cmd/installable-flake.hh"
-#include "nix/cmd/installable-derived-path.hh"
 #include "nix/store/outputs-spec.hh"
 #include "nix/util/util.hh"
 #include "nix/cmd/command.hh"
 #include "nix/expr/attr-path.hh"
 #include "nix/cmd/common-eval-args.hh"
-#include "nix/store/derivations.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
-#include "nix/expr/get-drvs.hh"
-#include "nix/store/store-api.hh"
-#include "nix/main/shared.hh"
+#include "nix/expr/eval-error.hh"
 #include "nix/flake/flake.hh"
 #include "nix/expr/eval-cache.hh"
-#include "nix/util/url.hh"
-#include "nix/fetchers/registry.hh"
-#include "nix/store/build-result.hh"
-
-#include <regex>
-#include <queue>
 
 #include <nlohmann/json.hpp>
 
@@ -171,11 +160,16 @@ std::vector<ref<eval_cache::AttrCursor>> InstallableFlake::getCursors(EvalState 
     for (auto & attrPath : attrPaths) {
         debug("trying flake output attribute '%s'", attrPath);
 
-        auto attr = root->findAlongAttrPath(AttrPath::parse(state, attrPath));
-        if (attr) {
-            res.push_back(ref(*attr));
-        } else {
-            suggestions += attr.getSuggestions();
+        try {
+            auto attr = root->findAlongAttrPath(AttrPath::parse(state, attrPath));
+            if (attr) {
+                res.push_back(ref(*attr));
+            } else {
+                suggestions += attr.getSuggestions();
+            }
+        } catch (TypeError & e) {
+            debug("error resolving attribute '%s': %s", attrPath, e.msg());
+            // Continue to next attribute path
         }
     }
 

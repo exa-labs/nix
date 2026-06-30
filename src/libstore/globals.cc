@@ -4,12 +4,11 @@
 #include "nix/util/config-global.hh"
 #include "nix/util/current-process.hh"
 #include "nix/util/executable-path.hh"
-#include "nix/util/archive.hh"
+#include "nix/util/file-system.hh"
 #include "nix/util/args.hh"
 #include "nix/util/abstract-setting-to-json.hh"
 #include "nix/util/compute-levels.hh"
 #include "nix/util/executable-path.hh"
-#include "nix/util/signals.hh"
 #include "nix/store/filetransfer.hh"
 
 #include <algorithm>
@@ -34,8 +33,6 @@
 #  include "nix/util/processes.hh"
 #endif
 
-#include "nix/util/config-impl.hh"
-
 #ifdef __APPLE__
 #  include <sys/sysctl.h>
 #endif
@@ -48,30 +45,13 @@
 
 namespace nix {
 
-/* The default location of the daemon socket, relative to nixStateDir.
-   The socket is in a directory to allow you to control access to the
-   Nix daemon by setting the mode/ownership of the directory
-   appropriately.  (This wouldn't work on the socket itself since it
-   must be deleted and recreated on startup.) */
-#define DEFAULT_SOCKET_PATH "daemon-socket" / "socket"
+void Settings::anchor() {}
 
-LogFileSettings::LogFileSettings()
-    : nixLogDir(getEnvOsNonEmpty(OS_STR("NIX_LOG_DIR"))
-                    .transform([](auto && s) { return std::filesystem::path(s); })
-                    .or_else([]() -> std::optional<std::filesystem::path> {
-#ifdef _WIN32
-#  ifdef NIX_LOG_DIR
-#    error "NIX_LOG_DIR should not be defined on Windows"
-#  endif
-                        return windows::known_folders::getProgramData() / "nix" / "log";
-#else
-                        return NIX_LOG_DIR;
-#endif
-                    })
-                    .transform([](auto && s) { return canonPath(s); })
-                    .value())
-{
-}
+void NarInfoDiskCacheSettings::anchor() {}
+
+void LogFileSettings::anchor() {}
+
+void AutoAllocateUidSettings::anchor() {}
 
 Settings settings;
 
@@ -92,12 +72,6 @@ Settings::Settings()
                       })
                       .transform([](auto && s) { return canonPath(s); })
                       .value())
-    , nixDaemonSocketFile(
-          getEnvOsNonEmpty(OS_STR("NIX_DAEMON_SOCKET_PATH"))
-              .transform([](auto && s) { return std::filesystem::path(s); })
-              .or_else([this]() -> std::optional<std::filesystem::path> { return nixStateDir / DEFAULT_SOCKET_PATH; })
-              .transform([](auto && s) { return canonPath(s); })
-              .value())
 {
 #ifndef _WIN32
     buildUsersGroup = isRootUser() ? "nixbld" : "";
@@ -281,11 +255,11 @@ StringSet Settings::getDefaultExtraPlatforms()
     // machines. Note that we can’t force processes from executing
     // x86_64 in aarch64 environments or vice versa since they can
     // always exec with their own binary preferences.
+    //
+    // The runtime file exists iff Rosetta 2 is installed; checking it avoids
+    // spawning a subprocess during static initialization of `settings`.
     if (std::string{NIX_LOCAL_SYSTEM} == "aarch64-darwin"
-        && runProgram(
-               RunOptions{.program = "arch", .args = {"-arch", "x86_64", "/usr/bin/true"}, .mergeStderrToStdout = true})
-                   .first
-               == 0)
+        && pathExists("/Library/Apple/usr/libexec/oah/libRosettaRuntime"))
         extraPlatforms.insert("x86_64-darwin");
 #endif
 

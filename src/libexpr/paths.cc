@@ -22,10 +22,55 @@ SourcePath EvalState::storePath(const StorePath & path)
     return {rootFS, CanonPath{store->printStorePath(path)}};
 }
 
+void EvalState::ensureLazyPathCopied(const StorePath & path)
+{
+    if (settings.isReadOnly())
+        return;
+
+    auto mount = storeFS->getMount(CanonPath(store->printStorePath(path)));
+    if (!mount)
+        return;
+
+    /* TODO: We could memoise this in-memory if necessary. */
+    auto storePath = fetchToStore(
+        fetchSettings,
+        *store,
+        SourcePath{ref(mount)},
+        /* Force a copy. mountInput does a dryRun to just calculate the storePath and narHash. */
+        FetchMode::Copy,
+        path.name());
+
+    /* This can happen if the source gets modified by another process while we are evaluaing
+       from it. Alternatively, the caching might be unsound and fetcher cache is poisoned somehow.
+       See https://github.com/NixOS/nix/issues/14317. */
+    if (storePath != path) {
+        throw Error(
+            (unsigned int) 102,
+            "store path ('%1%') was hashed to avoid a full copy at first, but upon reading it again, the contents have changed ('%2%'), so we can not proceed. Make sure files do not change during evaluation",
+            store->printStorePath(path),
+            store->printStorePath(storePath));
+    }
+}
+
+void EvalState::ensureLazyPathsCopied(const NixStringContext & context)
+{
+    for (const auto & c : context)
+        if (auto * o = std::get_if<NixStringContextElem::Opaque>(&c.raw))
+            /* TODO: This could be done in parallel. */
+            ensureLazyPathCopied(o->path);
+}
+
 StorePath
 EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalInput, ref<SourceAccessor> accessor)
 {
-    auto [storePath, narHash] = fetchToStore2(fetchSettings, *store, accessor, FetchMode::Copy, input.getName());
+    /* To mount the input, dryRun is sufficient. We still compute the narHash (to check for mismatches) and the store
+       path to figure out where to mount it. TODO: This could be relaxed in the future by making outPath and narHash
+       lazier. Good code that doesn't do `toString ./.` or otherwise inspects the outPath string and only uses it for
+       doing relative imports does not even require computing the store path. That is a big invasive change though and
+       would require having a special "LazyStorePathString" thunk. narHash also doesn't need to be computed eagerly in
+       case it's not actually specified (like during local development with a dirty tree) - in that case narHash could
+       also become a lazy app/thunk that shares the state with the storePath delayed computation. */
+    auto [storePath, narHash] = fetchToStore2(fetchSettings, *store, accessor, FetchMode::DryRun, input.getName());
 
     allowPath(storePath); // FIXME: should just whitelist the entire virtual store
 

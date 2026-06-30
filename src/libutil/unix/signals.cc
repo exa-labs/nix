@@ -9,7 +9,7 @@
 
 namespace nix {
 
-using namespace unix;
+void Interrupted::anchor() {}
 
 std::atomic<bool> unix::_isInterrupted = false;
 
@@ -43,6 +43,8 @@ struct InterruptCallbacks
     std::map<Token, fun<void()>> callbacks;
 };
 
+InterruptCallback::~InterruptCallback() {}
+
 /* Required to avoid static initialization order fiasco. This allows global
    objects to safely register callbacks. */
 static Sync<InterruptCallbacks> & getInterruptCallbacks()
@@ -56,6 +58,7 @@ static Sync<InterruptCallbacks> & getInterruptCallbacks()
 
 static void signalHandlerThread(sigset_t set)
 {
+    using namespace nix::unix;
     while (true) {
         int signal = 0;
         sigwait(&set, &signal);
@@ -146,6 +149,8 @@ void unix::restoreSignals()
         throw SysError("restoring signals");
 }
 
+namespace {
+
 /* RAII helper to automatically deregister a callback. */
 struct InterruptCallbackImpl : InterruptCallback
 {
@@ -167,6 +172,8 @@ struct InterruptCallbackImpl : InterruptCallback
         interruptCallbacks->callbacks.erase(token);
     }
 };
+
+} // namespace
 
 std::unique_ptr<InterruptCallback> createInterruptCallback(fun<void()> callback)
 {

@@ -1,4 +1,3 @@
-#include "nix/store/store-open.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/dummy-store.hh"
 #include "nix/fetchers/fetch-settings.hh"
@@ -98,7 +97,7 @@ static void commitAll(git_repository * repo, const char * msg)
 
 } // namespace
 
-using namespace nix;
+namespace nix::fetchers {
 
 class GitTest : public ::testing::Test
 {
@@ -201,3 +200,5 @@ TEST_F(GitTest, submodulePeriodSupport)
 
     ASSERT_EQ(accessor->readFile(CanonPath("deps/sub/lib.txt")), "hello from submodule\n");
 }
+
+} // namespace nix::fetchers

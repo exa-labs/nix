@@ -1,3 +1,4 @@
+#include "nix/cmd/command.hh"
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
@@ -5,8 +6,10 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/store/derived-path.hh"
 #include "nix/util/os-string.hh"
 #include "nix/util/signals.hh"
+#include "nix/util/mounted-source-accessor.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/outputs-spec.hh"
@@ -30,9 +33,7 @@
 // FIXME is this supposed to be private or not?
 #include "flake-command.hh"
 
-using namespace nix;
-using namespace nix::flake;
-using json = nlohmann::json;
+namespace nix {
 
 struct CmdFlakeUpdate;
 
@@ -52,7 +53,7 @@ FlakeRef FlakeCommand::getFlakeRef()
     return parseFlakeRef(fetchSettings, flakeUrl, std::filesystem::current_path().string()); // FIXME
 }
 
-LockedFlake FlakeCommand::lockFlake()
+flake::LockedFlake FlakeCommand::lockFlake()
 {
     return flake::lockFlake(flakeSettings, *getEvalState(), getFlakeRef(), lockFlags);
 }
@@ -89,7 +90,7 @@ public:
             .optional = true,
             .handler = {[&](std::vector<std::string> inputsToUpdate) {
                 for (const auto & inputToUpdate : inputsToUpdate) {
-                    std::optional<NonEmptyInputAttrPath> inputAttrPath;
+                    std::optional<flake::NonEmptyInputAttrPath> inputAttrPath;
                     try {
                         inputAttrPath = flake::NonEmptyInputAttrPath::parse(inputToUpdate);
                         if (!inputAttrPath)
@@ -217,8 +218,10 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
         auto lockedFlake = lockFlake();
         auto & flake = lockedFlake.flake;
 
-        // Currently, all flakes are in the Nix store via the rootFS accessor.
-        auto storePath = store->printStorePath(store->toStorePath(flake.path.path.abs()).first);
+        /* Flakes do not get copied to the store, but are instead mounted at
+           their expected store paths in storeFS. Querying metadata does not
+           force copying to the store, as one would expect. */
+        auto storePath = store->toStorePath(flake.path.path.abs()).first;
 
         if (json) {
             nlohmann::json j;
@@ -240,7 +243,7 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
                 j["revCount"] = *revCount;
             if (auto lastModified = flake.lockedRef.input.getLastModified())
                 j["lastModified"] = *lastModified;
-            j["path"] = storePath;
+            j["path"] = store->printStorePath(storePath);
             j["locks"] = lockedFlake.lockFile.toJSON().first;
             if (auto fingerprint = lockedFlake.getFingerprint(*store, fetchSettings))
                 j["fingerprint"] = fingerprint->to_string(HashFormat::Base16, false);
@@ -251,7 +254,7 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
                 logger->cout(ANSI_BOLD "Locked URL:" ANSI_NORMAL "    %s", flake.lockedRef.to_string());
             if (flake.description)
                 logger->cout(ANSI_BOLD "Description:" ANSI_NORMAL "   %s", *flake.description);
-            logger->cout(ANSI_BOLD "Path:" ANSI_NORMAL "          %s", storePath);
+            logger->cout(ANSI_BOLD "Path:" ANSI_NORMAL "          %s", store->printStorePath(storePath));
             if (auto rev = flake.lockedRef.input.getRev())
                 logger->cout(ANSI_BOLD "Revision:" ANSI_NORMAL "      %s", rev->to_string(HashFormat::Base16, false));
             if (auto dirtyRev = fetchers::maybeGetStrAttr(flake.lockedRef.toAttrs(), "dirtyRev"))
@@ -269,12 +272,10 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
             if (!lockedFlake.lockFile.root->inputs.empty())
                 logger->cout(ANSI_BOLD "Inputs:" ANSI_NORMAL);
 
-            std::set<ref<Node>> visited{lockedFlake.lockFile.root};
+            std::set<ref<flake::Node>> visited{lockedFlake.lockFile.root};
 
-            [&](this const auto & recurse, const Node & node, const std::string & prefix) -> void {
-                for (const auto & [i, input] : enumerate(node.inputs)) {
-                    bool last = i + 1 == node.inputs.size();
-
+            [&](this const auto & recurse, const flake::Node & node, const std::string & prefix) -> void {
+                for (const auto & [last, input] : markLast(node.inputs)) {
                     if (auto lockedNode = std::get_if<0>(&input.second)) {
                         std::string lastModifiedStr = "";
                         if (auto lastModified = (*lockedNode)->lockedRef.input.getLastModified())
@@ -295,7 +296,7 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
                             "%s" ANSI_BOLD "%s" ANSI_NORMAL " follows input '%s'",
                             prefix + (last ? treeLast : treeConn),
                             input.first,
-                            printInputAttrPath(*follows));
+                            flake::printInputAttrPath(*follows));
                     }
                 }
             }(*lockedFlake.lockFile.root, "");
@@ -312,12 +313,13 @@ struct CmdFlakeInfo : CmdFlakeMetadata
     }
 };
 
-struct CmdFlakeCheck : FlakeCommand
+struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 {
     bool build = true;
     bool checkAllSystems = false;
 
     CmdFlakeCheck()
+        : MixOutLinkBase(std::nullopt)
     {
         addFlag({
             .longName = "no-build",
@@ -328,6 +330,15 @@ struct CmdFlakeCheck : FlakeCommand
             .longName = "all-systems",
             .description = "Check the outputs for all systems.",
             .handler = {&checkAllSystems, true},
+        });
+        addFlag({
+            .longName = "out-link",
+            .shortName = 'o',
+            .description =
+                "Use *path* as prefix for the symlinks to the check results. By default, no out links are created.",
+            .labels = {"path"},
+            .handler = {&outLink},
+            .completer = completePath,
         });
     }
 
@@ -785,6 +796,7 @@ struct CmdFlakeCheck : FlakeCommand
             });
         }
 
+        std::vector<KeyedBuildResult> results;
         if (build && !attrPathsByDrv.empty()) {
             auto keys = std::views::keys(attrPathsByDrv);
             std::vector<DerivedPath> drvPaths(keys.begin(), keys.end());
@@ -811,7 +823,9 @@ struct CmdFlakeCheck : FlakeCommand
             }
 
             Activity act(*logger, lvlInfo, actUnknown, fmt("running %d flake checks", toBuild.size()));
-            auto results = store->buildPathsWithResults(toBuild);
+
+            // once we get rid of the temporary hack above, this tenary operator will also go away
+            results = store->buildPathsWithResults((printOutputPaths || outLink) ? drvPaths : toBuild);
 
             // Report build failures with attribute paths
             for (auto & result : results) {
@@ -845,6 +859,14 @@ struct CmdFlakeCheck : FlakeCommand
                 "Use '--all-systems' to check all.",
                 concatStringsSep(", ", omittedSystems));
         };
+
+        auto builtPaths =
+            results | std::views::transform([&](auto & result) { return toBuiltPath(result, getEvalStore(), store); })
+            | std::ranges::to<BuiltPaths>();
+
+        printOutPathsMaybe(builtPaths, store);
+
+        createOutLinksMaybe(builtPaths, store);
     };
 };
 
@@ -856,7 +878,7 @@ struct CmdFlakeInitCommon : virtual Args, EvalCommand
     std::string templateUrl = "templates";
     std::filesystem::path destDir;
 
-    const LockFlags lockFlags{.writeLockFile = false};
+    const flake::LockFlags lockFlags{.writeLockFile = false};
 
     CmdFlakeInitCommon()
     {
@@ -1092,29 +1114,34 @@ struct CmdFlakeArchive : FlakeCommand, MixJSON, MixDryRun, MixNoCheckSigs
 
         StorePathSet sources;
 
-        auto storePath = store->toStorePath(flake.flake.path.path.abs()).first;
+        auto getStorePath = [&](const FlakeRef & lockedRef) {
+            return dryRun ? lockedRef.input.computeStorePath(*store)
+                          : std::get<StorePath>(lockedRef.input.fetchToStore(fetchSettings, *store));
+        };
+
+        auto storePath = getStorePath(flake.flake.lockedRef);
 
         sources.insert(storePath);
 
         // FIXME: use graph output, handle cycles.
-        std::function<nlohmann::json(const Node & node)> traverse;
-        traverse = [&](const Node & node) {
-            nlohmann::json jsonObj2 = json ? json::object() : nlohmann::json(nullptr);
+        auto traverse = [&store, json = json, &sources, &getStorePath](
+                            this const auto & self, const flake::Node & node) -> nlohmann::json {
+            nlohmann::json jsonObj2 = json ? nlohmann::json::object() : nlohmann::json(nullptr);
             for (auto & [inputName, input] : node.inputs) {
                 if (auto inputNode = std::get_if<0>(&input)) {
                     std::optional<StorePath> storePath;
-                    if (!(*inputNode)->lockedRef.input.isRelative()) {
-                        storePath = dryRun ? (*inputNode)->lockedRef.input.computeStorePath(*store)
-                                           : (*inputNode)->lockedRef.input.fetchToStore(fetchSettings, *store).first;
+                    const auto & lockedRef = (*inputNode)->lockedRef;
+                    if (!lockedRef.input.isRelative()) {
+                        storePath = getStorePath(lockedRef);
                         sources.insert(*storePath);
                     }
                     if (json) {
                         auto & jsonObj3 = jsonObj2[inputName];
                         if (storePath)
                             jsonObj3["path"] = store->printStorePath(*storePath);
-                        jsonObj3["inputs"] = traverse(**inputNode);
+                        jsonObj3["inputs"] = self(**inputNode);
                     } else
-                        traverse(**inputNode);
+                        self(**inputNode);
                 }
             }
             return jsonObj2;
@@ -1174,7 +1201,7 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
         evalSettings.enableImportFromDerivation.setDefault(false);
 
         auto state = getEvalState();
-        auto flake = make_ref<LockedFlake>(lockFlake());
+        auto flake = make_ref<flake::LockedFlake>(lockFlake());
         auto localSystem = std::string(settings.thisSystem.get());
 
         std::function<bool(eval_cache::AttrCursor & visitor, const AttrPath & attrPath, const Symbol & attr)>
@@ -1254,9 +1281,8 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                             attrs.push_back(attr);
                     }
 
-                    for (const auto & [i, attr] : enumerate(attrs)) {
+                    for (const auto & [last, attr] : markLast(attrs)) {
                         const auto & attrName = state->symbols[attr];
-                        bool last = i + 1 == attrs.size();
                         auto visitor2 = visitor.getAttr(attrName);
                         auto attrPath2(attrPath);
                         attrPath2.push_back(attr);
@@ -1567,3 +1593,5 @@ static auto rCmdFlakeNew = registerCommand2<CmdFlakeNew>({"flake", "new"});
 static auto rCmdFlakePrefetch = registerCommand2<CmdFlakePrefetch>({"flake", "prefetch"});
 static auto rCmdFlakeShow = registerCommand2<CmdFlakeShow>({"flake", "show"});
 static auto rCmdFlakeUpdate = registerCommand2<CmdFlakeUpdate>({"flake", "update"});
+
+} // namespace nix

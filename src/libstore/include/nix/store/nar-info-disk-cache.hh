@@ -12,6 +12,11 @@ struct NarInfoDiskCacheSettings;
 
 struct NarInfoDiskCache
 {
+private:
+    /* VTable anchor to avoid weak linkage of the vtable - it breaks
+       dynamic_cast across shared libraries on Darwin. */
+    virtual void anchor();
+public:
     using Settings = NarInfoDiskCacheSettings;
 
     const Settings & settings;
@@ -25,15 +30,18 @@ struct NarInfoDiskCache
 
     virtual ~NarInfoDiskCache() {}
 
-    virtual int
-    createCache(const std::string & uri, const std::string & storeDir, bool wantMassQuery, int priority) = 0;
-
     struct CacheInfo
     {
-        int id;
-        bool wantMassQuery;
-        int priority;
+        int id = 0;
+        bool wantMassQuery = false;
+        int priority = 0;
     };
+
+    /**
+     * Create or update the cached nix-cache-info for the binary cache at `uri`.
+     * Note that `info.id` is ignored. This function returns the id of the cache entry.
+     */
+    virtual int createCache(const std::string & uri, const std::string & storeDir, const CacheInfo & info) = 0;
 
     virtual std::optional<CacheInfo> upToDateCacheExists(const std::string & uri) = 0;
 

@@ -16,6 +16,10 @@ class RemoteFSAccessor;
 
 struct BinaryCacheStoreConfig : virtual StoreConfig
 {
+private:
+    void anchor() override;
+
+public:
     BinaryCacheStoreConfig(const Params & params)
         : StoreConfig(params, FilePathType::Unix)
     {
@@ -58,7 +62,11 @@ struct BinaryCacheStoreConfig : virtual StoreConfig
         this,
         false,
         "parallel-compression",
-        "Enable multi-threaded compression of NARs. This is currently only available for `xz` and `zstd`."};
+        R"(
+          Enable multi-threaded compression of NARs. This is currently only available for `xz` and `zstd`.
+
+          If not set explicitly, defaults to `true` when `compression` is `zstd` and `false` otherwise.
+        )"};
 
     Setting<int> compressionLevel{
         this,
@@ -88,6 +96,8 @@ struct alignas(8) /* Work around ASAN failures on i686-linux. */
     Config & config;
 
 private:
+    void anchor() override;
+
     std::vector<std::unique_ptr<Signer>> signers;
 
 protected:
@@ -173,6 +183,23 @@ private:
 
     void writeNarInfo(ref<NarInfo> narInfo);
 
+    /**
+     * Upload the NAR for a path and everything else *except* the
+     * `.narinfo` file (i.e. the compressed NAR, an optional NAR
+     * listing, and optional debuginfo links), and construct the
+     * corresponding `NarInfo`. The returned `NarInfo` is neither signed
+     * nor published yet; call `uploadNarInfo()` to do that.
+     */
+    ref<NarInfo> uploadData(Source & narSource, RepairFlag repair, fun<ValidPathInfo(HashResult)> mkInfo);
+
+    /**
+     * Sign and publish the `.narinfo` file for a path whose NAR has
+     * already been uploaded by `uploadData()`. This is what establishes
+     * the closure invariant, so all of the path's references must
+     * already be valid in the store.
+     */
+    void uploadNarInfo(ref<NarInfo> narInfo);
+
     ref<const ValidPathInfo> addToStoreCommon(
         Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo);
 
@@ -192,6 +219,9 @@ public:
 
     void
     addToStore(const ValidPathInfo & info, Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs) override;
+
+    void
+    addMultipleToStore(PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override;
 
     StorePath addToStoreFromDump(
         Source & dump,

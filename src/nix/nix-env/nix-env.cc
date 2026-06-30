@@ -2,6 +2,7 @@
 #include "nix/expr/attr-path.hh"
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/store/derivations.hh"
+#include "nix/store/outputs-query.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/store/globals.hh"
@@ -32,8 +33,7 @@
 #include <unistd.h>
 #include <nlohmann/json.hpp>
 
-using namespace nix;
-using std::cout;
+namespace nix {
 
 /**
  * Settings related to Nix user environments.
@@ -66,7 +66,7 @@ struct EnvSettings : Config
 
 EnvSettings envSettings;
 
-static GlobalConfig::Register rSettings(&envSettings);
+static GlobalConfig::Register rEnvSettings(&envSettings);
 
 typedef enum { srcNixExprDrvs, srcNixExprs, srcStorePaths, srcProfile, srcAttrPath, srcUnknown } InstallSourceType;
 
@@ -457,7 +457,7 @@ static void queryInstSources(
 
             if (path.isDerivation()) {
                 elem.setDrvPath(path);
-                auto outputs = state.store->queryDerivationOutputMap(path);
+                auto outputs = deepQueryDerivationOutputMap(*state.store, path);
                 elem.setOutPath(outputs.at("out"));
                 if (name.size() >= drvExtension.size()
                     && std::string(name, name.size() - drvExtension.size()) == drvExtension)
@@ -1072,7 +1072,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
     /* Print the desired columns, or XML output. */
     if (jsonOutput) {
         queryJSON(globals, elems, printOutPath, printDrvPath, printMeta);
-        cout << '\n';
+        std::cout << '\n';
         return;
     }
 
@@ -1081,7 +1081,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
 
     Table table;
     std::ostringstream dummy;
-    XMLWriter xml(true, *(xmlOutput ? &cout : &dummy));
+    XMLWriter xml(true, *(xmlOutput ? &std::cout : &dummy));
     XMLOpenElement xmlRoot(xml, "items");
 
     for (auto & i : elems) {
@@ -1273,7 +1273,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
             } else
                 table.push_back(columns);
 
-            cout.flush();
+            std::cout.flush();
 
         } catch (AssertionError & e) {
             printMsg(lvlTalkative, "skipping derivation named '%1%' which gives an assertion failure", i.queryName());
@@ -1535,3 +1535,5 @@ static int main_nix_env(int argc, char ** argv)
 }
 
 static RegisterLegacyCommand r_nix_env("nix-env", main_nix_env);
+
+} // namespace nix

@@ -23,10 +23,11 @@ namespace nix {
 
 const std::filesystem::path & nixConfDir();
 
-struct FileTransferSettings : Config
+class FileTransferSettings : public Config
 {
-private:
     static std::optional<std::filesystem::path> getDefaultSSLCertFile();
+
+    void anchor() override;
 
 public:
     FileTransferSettings();
@@ -44,6 +45,18 @@ public:
           when one stream is paused (e.g. during slow store imports),
           which would otherwise throttle all multiplexed streams on the
           same TCP connection. Defaults to 100 (libcurl default).
+        )"};
+
+    Setting<bool> enableHttp3{
+        this,
+        false,
+        "http3",
+        R"(
+          Whether to try enabling HTTP/3 (QUIC).
+          When enabled, Nix requests HTTP/3 and transparently falls back
+          to HTTP/2 or HTTP/1.1 for servers that do not support it.
+          This option has no effect unless the `nix` binary is linked
+          against a libcurl built with HTTP/3 (QUIC) support.
         )"};
 
     Setting<std::string> userAgentSuffix{
@@ -321,6 +334,14 @@ struct FileTransferRequest
     }
 
     /**
+     * `uri` with any userinfo (`user:password@`) stripped, for use in
+     * progress, warning and error messages so credentials embedded in
+     * the URL don't leak into logs. Returns `uri` verbatim if it can't
+     * be parsed.
+     */
+    std::string displayUri() const;
+
+    /**
      * Returns the method description for logging purposes.
      */
     std::string verb(bool continuous = false) const
@@ -414,16 +435,16 @@ public:
      */
     struct ItemHandle
     {
-        std::reference_wrapper<Item> item;
+        std::weak_ptr<Item> item;
         friend struct FileTransfer;
 
-        ItemHandle(Item & item)
+        explicit ItemHandle(std::weak_ptr<Item> item)
             : item(item)
         {
         }
     };
 
-    virtual ~FileTransfer() {}
+    virtual ~FileTransfer();
 
     /**
      * Enqueue a data transfer request, returning a future to the result of
@@ -462,7 +483,7 @@ public:
     void
     download(FileTransferRequest && request, Sink & sink, std::function<void(FileTransferResult)> resultCallback = {});
 
-    enum Error { NotFound, Forbidden, Misc, Transient, Interrupted };
+    enum Error { NotFound, Unauthorized, Forbidden, Misc, Transient, Interrupted };
 };
 
 /**
@@ -482,6 +503,9 @@ ref<FileTransfer> makeFileTransfer(const FileTransferSettings & settings = fileT
 
 class FileTransferError final : public CloneableError<FileTransferError, Error>
 {
+private:
+    void anchor() override;
+
 public:
     FileTransfer::Error error;
     /// intentionally optional

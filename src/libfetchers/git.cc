@@ -1,25 +1,21 @@
+#include "nix/util/environment-variables.hh"
 #include "nix/util/error.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/util/users.hh"
 #include "nix/fetchers/cache.hh"
-#include "nix/store/globals.hh"
-#include "nix/util/tarfile.hh"
 #include "nix/store/store-api.hh"
-#include "nix/util/url-parts.hh"
 #include "nix/store/pathlocks.hh"
 #include "nix/util/os-string.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/git.hh"
 #include "nix/fetchers/git-utils.hh"
 #include "nix/util/logging.hh"
-#include "nix/util/finally.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/json-utils.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/memo.hh"
 #include "nix/util/mounted-source-accessor.hh"
 
-#include <regex>
-#include <string.h>
 #include <sys/time.h>
 
 #ifndef _WIN32
@@ -31,12 +27,6 @@ using namespace std::string_literals;
 namespace nix::fetchers {
 
 namespace {
-
-// Explicit initial branch of our bare repo to suppress warnings from new version of git.
-// The value itself does not matter, since we always fetch a specific revision or branch.
-// It is set with `-c init.defaultBranch=` instead of `--initial-branch=` to stay compatible with
-// old version of git, which will ignore unrecognized `-c` options.
-const std::string gitInitialBranch = "__nix_dummy_branch";
 
 static bool isCacheFileWithinTtl(const Settings & settings, time_t now, const PosixStat & st)
 {
@@ -131,7 +121,7 @@ static std::optional<std::string> readHeadCached(const Settings & settings, cons
     std::optional<std::string> cachedRef;
     if (st) {
         cachedRef = readHead(cacheDir);
-        if (cachedRef != std::nullopt && *cachedRef != gitInitialBranch && isCacheFileWithinTtl(settings, now, *st)) {
+        if (cachedRef != std::nullopt && isCacheFileWithinTtl(settings, now, *st)) {
             debug("using cached HEAD ref '%s' for repo '%s'", *cachedRef, actualUrl);
             return cachedRef;
         }
@@ -173,6 +163,13 @@ std::vector<PublicKey> getPublicKeys(const Attrs & attrs)
 } // end namespace
 
 static const Hash nullRev{HashAlgorithm::SHA1};
+
+static LazyAttr makeLazyAttr(fun<ResolvedAttr()> compute)
+{
+    return make_ref<LazyAttrComputation>(LazyAttrComputation{
+        .compute = memo<ResolvedAttr>(std::move(compute)),
+    });
+}
 
 struct GitInputScheme : InputScheme
 {
@@ -466,7 +463,7 @@ struct GitInputScheme : InputScheme
 
         args.push_back(destDir.native());
 
-        runProgram("git", true, args, {}, true);
+        runProgram("git", true, args, true);
     }
 
     std::optional<std::filesystem::path> getSourcePath(const Input & input) const override
@@ -526,6 +523,10 @@ struct GitInputScheme : InputScheme
                 });
 
             if (commitMsg) {
+                auto [tempFd, tempPath] = createTempFile("nix-msg");
+                AutoDelete delTemp(tempPath, /*recursive=*/false);
+                writeFull(tempFd.get(), *commitMsg);
+
                 // Pause the logger to allow for user input (such as a gpg passphrase) in `git commit`
                 auto suspension = logger->suspend();
                 runProgram(
@@ -539,9 +540,10 @@ struct GitInputScheme : InputScheme
                         OS_STR("commit"),
                         string_to_os_string(std::string(path.rel())),
                         OS_STR("-F"),
-                        OS_STR("-"),
-                    },
-                    *commitMsg);
+                        tempPath.native(),
+                    });
+
+                delTemp.deletePath();
             }
         }
     }
@@ -729,14 +731,12 @@ struct GitInputScheme : InputScheme
     }
 
     uint64_t getRevCount(
-        const Settings & settings,
-        const RepoInfo & repoInfo,
-        const std::filesystem::path & repoDir,
-        const Hash & rev) const
+        ref<Cache> cache, const RepoInfo & repoInfo, const std::filesystem::path & repoDir, const Hash & rev) const
     {
-        Cache::Key key{"gitRevCount", {{"rev", rev.gitRev()}}};
+        if (GitRepo::openRepo(repoDir, {})->isShallow())
+            throw Error("'%s' is a shallow Git repository, so 'revCount' is not available", repoInfo.locationToArg());
 
-        auto cache = settings.getCache();
+        Cache::Key key{"gitRevCount", {{"rev", rev.gitRev()}}};
 
         if (auto revCountAttrs = cache->lookup(key))
             return getIntAttr(*revCountAttrs, "revCount");
@@ -749,6 +749,18 @@ struct GitInputScheme : InputScheme
         cache->upsert(key, Attrs{{"revCount", revCount}});
 
         return revCount;
+    }
+
+    LazyAttr lazyRevCount(
+        const Settings & settings,
+        const RepoInfo & repoInfo,
+        const std::filesystem::path & repoDir,
+        const Hash & rev) const
+    {
+        auto cache = settings.getCache();
+        return makeLazyAttr([this, cache, repoInfo, repoDir, rev]() -> ResolvedAttr {
+            return getRevCount(cache, repoInfo, repoDir, rev);
+        });
     }
 
     std::string getDefaultRef(const Settings & settings, const RepoInfo & repoInfo, bool shallow) const
@@ -774,7 +786,7 @@ struct GitInputScheme : InputScheme
                     "\n"
                     "To make it visible to Nix, run:\n"
                     "\n"
-                    "git -C %2% add \"%1%\"",
+                    "git -C %2% add -N \"%1%\"",
                     path.rel(),
                     PathFmt(repoPath));
             else
@@ -821,7 +833,7 @@ struct GitInputScheme : InputScheme
             repoDir = cacheDir;
             repoInfo.gitDir = ".";
 
-            std::filesystem::create_directories(cacheDir.parent_path());
+            createDirs(cacheDir.parent_path());
             PathLocks cacheDirLock({cacheDir.string()});
 
             auto repo = GitRepo::openRepo(cacheDir, {.create = true, .bare = true});
@@ -897,21 +909,21 @@ struct GitInputScheme : InputScheme
 
         auto repo = GitRepo::openRepo(repoDir, {});
 
-        auto isShallow = repo->isShallow();
-
-        if (isShallow && !getShallowAttr(input))
-            throw Error(
-                "'%s' is a shallow Git repository, but shallow repositories are only allowed when `shallow = true;` is specified",
-                repoInfo.locationToArg());
-
         // FIXME: check whether rev is an ancestor of ref?
 
         auto rev = *input.getRev();
 
-        input.attrs.insert_or_assign("lastModified", getLastModified(settings, repoInfo, repoDir, rev));
+        /* Skip lastModified computation if it's already supplied by the caller.
+           We don't care if they specify an incorrect value; it doesn't
+           matter for security, unlike narHash. */
+        if (!input.attrs.contains("lastModified"))
+            input.attrs.insert_or_assign("lastModified", getLastModified(settings, repoInfo, repoDir, rev));
 
-        if (!getShallowAttr(input))
-            input.attrs.insert_or_assign("revCount", getRevCount(settings, repoInfo, repoDir, rev));
+        if (!getShallowAttr(input)) {
+            /* Like lastModified, skip revCount if supplied by the caller. */
+            if (!input.attrs.contains("revCount"))
+                input.attrs.insert_or_assign("revCount", lazyRevCount(settings, repoInfo, repoDir, rev));
+        }
 
         printTalkative("using revision %s of repo '%s'", rev.gitRev(), repoInfo.locationToArg());
 
@@ -1032,8 +1044,11 @@ struct GitInputScheme : InputScheme
 
             input.attrs.insert_or_assign("rev", rev.gitRev());
             if (!getShallowAttr(input)) {
-                input.attrs.insert_or_assign(
-                    "revCount", rev == nullRev ? 0 : getRevCount(settings, repoInfo, repoPath, rev));
+                if (rev == nullRev) {
+                    input.attrs.insert_or_assign("revCount", uint64_t(0));
+                } else {
+                    input.attrs.insert_or_assign("revCount", lazyRevCount(settings, repoInfo, repoPath, rev));
+                }
             }
 
             verifyCommit(input, repo);
@@ -1097,7 +1112,7 @@ struct GitInputScheme : InputScheme
                 for (auto & file : repoInfo.workdirInfo.dirtyFiles) {
                     writeString("modified:", hashSink);
                     writeString(file.abs(), hashSink);
-                    dumpPath((*repoPath / file.rel()).string(), hashSink);
+                    dumpPath(*repoPath / file.rel(), hashSink);
                 }
                 for (auto & file : repoInfo.workdirInfo.deletedFiles) {
                     writeString("deleted:", hashSink);

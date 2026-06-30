@@ -6,7 +6,7 @@
 project(
   'nix-json-schema-checks',
   version : files('.version'),
-  meson_version : '>= 1.1',
+  meson_version : '>= 1.8',
   license : 'LGPL-2.1-or-later',
 )
 
@@ -98,6 +98,17 @@ schemas += [
     'files' : [
       'dyn-dep-derivation.json',
       'simple-derivation.json',
+      'try-resolve' / 'no-inputs-before.json',
+      'try-resolve' / 'with-inputs-before.json',
+      'try-resolve' / 'resolution-failure-before.json',
+    ],
+  },
+  {
+    'stem' : 'derivation',
+    'schema' : schema_dir / 'derivation-resolved-v4.yaml',
+    'files' : [
+      'try-resolve' / 'no-inputs-after.json',
+      'try-resolve' / 'with-inputs-after.json',
     ],
   },
   {

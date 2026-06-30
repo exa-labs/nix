@@ -6,6 +6,7 @@
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
 #include "nix/util/exit.hh"
+#include "nix/util/signals.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
 #include "nix/util/environment-variables.hh"
@@ -42,6 +43,7 @@
 #include <fstream>
 #include <functional>
 #include <ranges>
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 #include <boost/container/small_vector.hpp>
@@ -276,6 +278,8 @@ EvalState::EvalState(
            mounted fetchTree. */
         auto accessor = settings.pureEval ? storeFS.cast<SourceAccessor>()
                                           : makeUnionSourceAccessor({getFSSourceAccessor(), storeFS});
+        /* Cache positive lstat/readlink results to speed up resolveSymlinks. */
+        accessor = makeCachingSourceAccessor(accessor);
 
         /* Apply access control if needed. */
         if (settings.restrictEval || settings.pureEval)
@@ -294,16 +298,20 @@ EvalState::EvalState(
           CanonPath("derivation-internal.nix"),
 #include "primops/derivation.nix.gen.hh"
           )}
+    , importedDrvToDerivation{internalFS->addFile(
+          CanonPath("imported-drv-to-derivation.nix"),
+#include "imported-drv-to-derivation.nix.gen.hh"
+          )}
     , store(store)
     , buildStore(buildStore ? buildStore : store)
     , inputCache(fetchers::InputCache::create())
     , debugRepl(nullptr)
     , debugStop(false)
     , trylevel(0)
-    , srcToStore(make_ref<decltype(srcToStore)::element_type>())
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
+    , lookupPathResolved(make_ref<decltype(lookupPathResolved)::element_type>())
     , regexCache(makeRegexCache())
 #if NIX_USE_BOEHMGC
     , baseEnvP(std::allocate_shared<Env *>(traceable_allocator<Env *>(), &mem.allocEnv(BASE_ENV_SIZE)))
@@ -313,6 +321,17 @@ EvalState::EvalState(
 #endif
     , staticBaseEnv{std::make_shared<StaticEnv>(nullptr, nullptr)}
 {
+#ifndef _WIN32
+    static std::once_flag stackSizeBumped;
+    std::call_once(stackSizeBumped, []() {
+        // Increase the default stack size for the evaluator and for
+        // libstdc++'s std::regex.
+        // This used to be 64 MiB, but macOS as deployed on GitHub Actions has a
+        // hard limit slightly under that, so we round it down a bit.
+        nix::ensureStackSizeAtLeast(60 * 1024 * 1024);
+    });
+#endif
+
     corepkgsFS->setPathDisplay("<nix", ">");
     internalFS->setPathDisplay("«nix-internal»", "");
 
@@ -648,27 +667,34 @@ std::optional<EvalState::Doc> EvalState::getDoc(Value & v)
     return {};
 }
 
+static StaticEnv::Vars lexicographicOrder(const SymbolTable & st, StaticEnv::Vars vars)
+{
+    std::ranges::sort(vars, [&st](const auto & lhs, const auto & rhs) {
+        return std::string_view(st[lhs.first]) < std::string_view(st[rhs.first]);
+    });
+    return vars;
+}
+
 // just for the current level of StaticEnv, not the whole chain.
-void printStaticEnvBindings(const SymbolTable & st, const StaticEnv & se)
+static void printStaticEnvBindings(const SymbolTable & st, const StaticEnv & se)
 {
     std::cout << ANSI_MAGENTA;
-    for (auto & i : se.vars)
-        std::cout << st[i.first] << " ";
+    for (auto & [name, displacement] : lexicographicOrder(st, se.vars))
+        std::cout << st[name] << " ";
     std::cout << ANSI_NORMAL;
     std::cout << std::endl;
 }
 
 // just for the current level of Env, not the whole chain.
-void printWithBindings(const SymbolTable & st, const Env & env)
+static void printWithBindings(const SymbolTable & st, const Env & env)
 {
     if (!env.values[0]->isThunk()) {
         std::cout << "with: ";
         std::cout << ANSI_MAGENTA;
-        auto j = env.values[0]->attrs()->begin();
-        while (j != env.values[0]->attrs()->end()) {
-            std::cout << st[j->name] << " ";
-            ++j;
-        }
+        auto * bindings = env.values[0]->attrs();
+        /* TODO: Don't print the whole attribute set, since it can be quite large. */
+        for (const Attr * attr : bindings->lexicographicOrder(st))
+            std::cout << st[attr->name] << " ";
         std::cout << ANSI_NORMAL;
         std::cout << std::endl;
     }
@@ -689,7 +715,7 @@ void printEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & 
         std::cout << ANSI_MAGENTA;
         // for the top level, don't print the double underscore ones;
         // they are in builtins.
-        for (auto & i : se.vars)
+        for (auto & i : lexicographicOrder(st, se.vars))
             if (!hasPrefix(st[i.first], "__"))
                 std::cout << st[i.first] << " ";
         std::cout << ANSI_NORMAL;
@@ -1073,6 +1099,8 @@ Value * ExprPath::maybeThunk(EvalState & state, Env & env)
     return &v;
 }
 
+namespace {
+
 /**
  * A helper `Expr` class to lets us parse and evaluate Nix expressions
  * from a thunk, ensuring that every file is parsed/evaluated only
@@ -1116,6 +1144,8 @@ struct ExprParseFile : Expr, gc
     }
 };
 
+} // namespace
+
 void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
 {
     auto resolvedPath = getConcurrent(*importResolutionCache, path);
@@ -1158,7 +1188,8 @@ void EvalState::resetFileCache()
     importResolutionCache->clear();
     fileEvalCache->clear();
     inputCache->clear();
-    positions.clear();
+    lookupPathResolved->clear();
+    rootFS->invalidateCache();
 }
 
 void EvalState::eval(Expr * e, Value & v)
@@ -2035,22 +2066,21 @@ void ExprOpConcatLists::eval(EvalState & state, Env & env, Value & v)
     Value v2;
     e2->eval(state, env, v2);
     Value * lists[2] = {&v1, &v2};
-    state.concatLists(v, 2, lists, pos, "while evaluating one of the elements to concatenate");
+    state.concatLists(v, lists, pos, "while evaluating one of the elements to concatenate");
 }
 
-void EvalState::concatLists(
-    Value & v, size_t nrLists, Value * const * lists, const PosIdx pos, std::string_view errorCtx)
+void EvalState::concatLists(Value & v, std::span<Value * const> lists, const PosIdx pos, std::string_view errorCtx)
 {
     nrListConcats++;
 
-    Value * nonEmpty = 0;
+    Value * nonEmpty = nullptr;
     size_t len = 0;
-    for (size_t n = 0; n < nrLists; ++n) {
-        forceList(*lists[n], pos, errorCtx);
-        auto l = lists[n]->listSize();
+    for (auto * list : lists) {
+        forceList(*list, pos, errorCtx);
+        auto l = list->listSize();
         len += l;
         if (l)
-            nonEmpty = lists[n];
+            nonEmpty = list;
     }
 
     if (nonEmpty && len == nonEmpty->listSize()) {
@@ -2060,12 +2090,13 @@ void EvalState::concatLists(
 
     auto list = buildList(len);
     auto out = list.elems;
-    for (size_t n = 0, pos = 0; n < nrLists; ++n) {
-        auto listView = lists[n]->listView();
-        auto l = listView.size();
-        if (l)
-            memcpy(out + pos, listView.data(), l * sizeof(Value *));
-        pos += l;
+    size_t pos2 = 0;
+    for (auto * l : lists) {
+        auto listView = l->listView();
+        auto n = listView.size();
+        if (n)
+            memcpy(out + pos2, listView.data(), n * sizeof(Value *));
+        pos2 += n;
     }
     v.mkList(list);
 }
@@ -2200,6 +2231,8 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
     Value * recovery = nullptr;
     try {
         std::rethrow_exception(e);
+    } catch (const Interrupted & e) {
+        recovery = allocValue();
     } catch (const RecoverableEvalError & e) {
         recovery = allocValue();
     } catch (...) {
@@ -2217,6 +2250,8 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
     Value * recovery = nullptr;
     try {
         std::rethrow_exception(e);
+    } catch (const Interrupted & e) {
+        recovery = allocValue();
     } catch (const RecoverableEvalError & e) {
         recovery = allocValue();
     } catch (...) {
@@ -2568,23 +2603,16 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
     if (nix::isDerivation(path.path.abs()))
         error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
 
-    auto dstPathCached = getConcurrent(*srcToStore, path);
-
-    auto dstPath = dstPathCached ? *dstPathCached : [&]() {
-        auto dstPath = fetchToStore(
-            fetchSettings,
-            *store,
-            path.resolveSymlinks(SymlinkResolution::Ancestors),
-            settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
-            path.baseName(),
-            ContentAddressMethod::Raw::NixArchive,
-            nullptr,
-            repair);
-        allowPath(dstPath);
-        srcToStore->try_emplace(path, dstPath);
-        printMsg(lvlChatty, "copied source '%1%' -> '%2%'", path, store->printStorePath(dstPath));
-        return dstPath;
-    }();
+    auto dstPath = fetchToStore(
+        fetchSettings,
+        *store,
+        path.resolveSymlinks(SymlinkResolution::Ancestors),
+        settings.isReadOnly() ? FetchMode::DryRun : FetchMode::Copy,
+        path.baseName(),
+        ContentAddressMethod::Raw::NixArchive,
+        nullptr,
+        repair);
+    allowPath(dstPath);
 
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
     return dstPath;
@@ -3261,14 +3289,28 @@ SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_
             continue;
         auto r = *rOpt;
 
-        auto res = (r / CanonPath(suffix)).resolveSymlinks();
-        if (res.pathExists())
+        auto suffixPath = CanonPath(suffix);
+        if (auto cachedRes = getConcurrent(*rOpt->resolvedPaths, suffixPath)) {
+            if (*cachedRes)
+                return **cachedRes;
+            else
+                // Cached negative lookup.
+                continue;
+        }
+
+        auto res = (r.path / suffixPath).resolveSymlinks();
+        if (res.pathExists()) {
+            r.resolvedPaths->emplace(suffixPath, res);
             return res;
+        }
 
         // Backward compatibility hack: throw an exception if access
         // to this path is not allowed.
         if (auto accessor = res.accessor.dynamic_pointer_cast<FilteringSourceAccessor>())
             accessor->checkAccess(res.path);
+
+        // Cache negative lookups too.
+        r.resolvedPaths->emplace(suffixPath, std::nullopt);
     }
 
     if (hasPrefix(path, "nix/"))
@@ -3282,19 +3324,23 @@ SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_
         .debugThrow();
 }
 
-std::optional<SourcePath> EvalState::resolveLookupPathPath(const LookupPath::Path & value0, bool initAccessControl)
+std::shared_ptr<EvalState::LookupPathResolvedState>
+EvalState::resolveLookupPathPath(const LookupPath::Path & value0, bool initAccessControl)
 {
     auto & value = value0.s;
-    auto i = lookupPathResolved.find(value);
-    if (i != lookupPathResolved.end())
-        return i->second;
+    if (auto cached = getConcurrent(*lookupPathResolved, value))
+        return *cached;
 
-    auto finish = [&](std::optional<SourcePath> res) {
-        if (res)
-            debug("resolved search path element '%s' to '%s'", value, *res);
-        else
+    auto finish = [&](std::optional<SourcePath> maybePath) {
+        std::shared_ptr<LookupPathResolvedState> res;
+        if (maybePath) {
+            debug("resolved search path element '%s' to '%s'", value, *maybePath);
+            res = std::make_shared<LookupPathResolvedState>(
+                *maybePath, make_ref<decltype(LookupPathResolvedState::resolvedPaths)::element_type>());
+        } else {
             debug("failed to resolve search path element '%s'", value);
-        lookupPathResolved.emplace(value, res);
+        }
+        lookupPathResolved->emplace(std::string(value), res);
         return res;
     };
 
@@ -3438,7 +3484,7 @@ void forceNoNullByte(std::string_view s, std::function<Pos()> pos)
         if (pos) {
             error.atPos(pos());
         }
-        throw error;
+        throw std::move(error);
     }
 }
 

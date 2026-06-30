@@ -27,6 +27,7 @@
 #include <map>
 #include <optional>
 #include <functional>
+#include <span>
 
 namespace nix {
 
@@ -395,6 +396,7 @@ public:
     const ref<MemorySourceAccessor> internalFS;
 
     const SourcePath derivationInternal;
+    const SourcePath importedDrvToDerivation;
 
     /**
      * Store used to materialise .drv files.
@@ -405,8 +407,6 @@ public:
      * Store used to build stuff.
      */
     const ref<Store> buildStore;
-
-    RootValue vImportedDrvToDerivation = nullptr;
 
     const ref<fetchers::InputCache> inputCache;
 
@@ -459,10 +459,6 @@ public:
 
 private:
 
-    /* Cache for calls to addToStore(); maps source paths to the store
-       paths. */
-    const ref<boost::concurrent_flat_map<SourcePath, StorePath>> srcToStore;
-
     /**
      * A cache that maps paths to "resolved" paths for importing Nix
      * expressions, i.e. `/foo` to `/foo/default.nix`.
@@ -488,7 +484,15 @@ private:
 
     LookupPath lookupPath;
 
-    boost::unordered_flat_map<std::string, std::optional<SourcePath>, StringViewHash, std::equal_to<>>
+    struct LookupPathResolvedState
+    {
+        SourcePath path;
+        const ref<boost::concurrent_flat_map<CanonPath, std::optional<SourcePath>>> resolvedPaths;
+    };
+
+    const ref<
+        boost::
+            concurrent_flat_map<std::string, std::shared_ptr<LookupPathResolvedState>, StringViewHash, std::equal_to<>>>
         lookupPathResolved;
 
     /**
@@ -625,9 +629,10 @@ public:
      *
      * If the specified search path element is a URI, download it.
      *
-     * If it is not found, return `std::nullopt`.
+     * If it is not found, return `nullptr`.
      */
-    std::optional<SourcePath> resolveLookupPathPath(const LookupPath::Path & elem, bool initAccessControl = false);
+    std::shared_ptr<LookupPathResolvedState>
+    resolveLookupPathPath(const LookupPath::Path & elem, bool initAccessControl = false);
 
     /**
      * Evaluate an expression to normal form
@@ -727,6 +732,26 @@ public:
 
     std::optional<std::string> tryAttrsToString(
         const PosIdx pos, Value & v, NixStringContext & context, bool coerceMore = false, bool copyToStore = true);
+
+    enum class CopyLazyPaths : bool {
+        PreserveLazy = false,
+        Copy = true,
+    };
+
+    /**
+     * For efficiency reasons, some store paths (as seen by the evaluator) in
+     * the storeFS at their content-addressed locations don't get copied to the
+     * store eagerly. This saves on needless I/O and possibly IPC if all the
+     * evaluator does is just evaluate nix expressions from those locations.
+     * This function copies such store objects to the store if they aren't already valid.
+     */
+    void ensureLazyPathCopied(const StorePath & path);
+
+    /**
+     * Ensure that all NixStringContextElem::Opaque context elements get fetched
+     * to the store.
+     */
+    void ensureLazyPathsCopied(const NixStringContext & context);
 
     /**
      * String coercion.
@@ -997,7 +1022,10 @@ public:
      */
     void mkSingleDerivedPathString(const SingleDerivedPath & p, Value & v);
 
-    void concatLists(Value & v, size_t nrLists, Value * const * lists, const PosIdx pos, std::string_view errorCtx);
+    /**
+     * @brief Concatenate values with an n-ary version of the `++` operator.
+     */
+    void concatLists(Value & v, std::span<Value * const> lists, const PosIdx pos, std::string_view errorCtx);
 
     /**
      * Print statistics, if enabled.
@@ -1031,9 +1059,14 @@ public:
 
     /**
      * Coerce `v` to a path and realise it, i.e. build anything in the value's string context using `realiseContext()`.
+     * @param copyLazyPaths When encountering a lazy path (i.e. a string with Opaque context that's also "mounted" on
+     * the storeFS), fetch the store path to the store.
      */
     SourcePath realisePath(
-        const PosIdx pos, Value & v, std::optional<SymlinkResolution> resolveSymlinks = SymlinkResolution::Full);
+        const PosIdx pos,
+        Value & v,
+        std::optional<SymlinkResolution> resolveSymlinks = SymlinkResolution::Full,
+        CopyLazyPaths copyLazyPaths = CopyLazyPaths::PreserveLazy);
 
     /**
      * Realise the given string with context, and return the string with outputs instead of downstream output

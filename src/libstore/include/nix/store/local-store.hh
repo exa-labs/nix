@@ -35,8 +35,9 @@ struct LocalSettings;
 
 struct LocalBuildStoreConfig : virtual LocalFSStoreConfig
 {
-
 private:
+    void anchor() override;
+
     /**
       Input for computing the build directory. See `getBuildDir()`.
      */
@@ -89,6 +90,7 @@ struct LocalStoreConfig : std::enable_shared_from_this<LocalStoreConfig>,
     LocalStoreConfig(const std::filesystem::path & path, const Params & params);
 
 private:
+    void anchor() override;
 
     /**
      * An indirection so that we don't need to refer to global settings
@@ -145,7 +147,7 @@ public:
           Whether to request garbage collector roots from an external daemon.
 
           When enabled, the garbage collector connects to a Unix domain socket
-          at [`<state-dir>`](@docroot@/store/types/local-store.md#store-option-state)`/gc-roots-socket/socket` to discover additional roots
+          at [`<state-dir>`](@docroot@/store/types/local-store.md#store-local-store-state)`/gc-roots-socket/socket` to discover additional roots
           that should not be collected. This is useful when the Nix daemon runs
           without root privileges and cannot scan `/proc` for runtime roots.
 
@@ -175,8 +177,12 @@ public:
     StoreReference getReference() const override;
 };
 
+MakeError(PathInUse, Error);
+
 class LocalStore : public virtual IndirectRootStore, public virtual GcStore
 {
+    void anchor() override;
+
 public:
 
     using Config = LocalStoreConfig;
@@ -212,6 +218,7 @@ private:
          */
         bool gcRunning = false;
         std::shared_future<void> gcFuture;
+        std::thread gcThread;
 
         /**
          * How much disk space was available after the previous
@@ -277,6 +284,9 @@ public:
 
     std::map<std::string, std::optional<StorePath>>
     queryStaticPartialDerivationOutputMap(const StorePath & path) override;
+
+    std::optional<StorePath>
+    queryStaticPartialDerivationOutput(const StorePath & path, const std::string & outputName) override;
 
     std::optional<StorePath> queryPathFromHashPart(const std::string & hashPart) override;
 
@@ -463,7 +473,12 @@ private:
 
     void openDB(State & state, bool create);
 
-    void upgradeDBSchema(State & state);
+    /**
+     * Perform or check if a database schema upgrade is needed.
+     * @param dryRun only check if an upgrade is needed.
+     * @return true if an upgrade is needed or was performed, false otherwise.
+     */
+    bool upgradeDBSchema(State & state, bool dryRun);
 
     void makeStoreWritable();
 
@@ -509,6 +524,8 @@ private:
 
     friend struct PathSubstitutionGoal;
     friend struct DerivationGoal;
+    /* Only used for createTempDirInStore. */
+    friend class DerivationBuilderImpl;
 };
 
 } // namespace nix

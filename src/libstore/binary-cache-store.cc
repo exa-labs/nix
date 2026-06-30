@@ -3,26 +3,32 @@
 #include "nix/util/compression.hh"
 #include "nix/store/derivations.hh"
 #include "nix/util/source-accessor.hh"
-#include "nix/store/globals.hh"
+#include "nix/store/nar-info-disk-cache.hh"
 #include "nix/store/nar-info.hh"
 #include "nix/util/sync.hh"
 #include "nix/store/remote-fs-accessor.hh"
-#include "nix/store/nar-info-disk-cache.hh"
 #include "nix/util/nar-accessor.hh"
 #include "nix/util/thread-pool.hh"
 #include "nix/util/callback.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/util.hh"
 
 #include <chrono>
 #include <future>
 #include <regex>
-#include <fstream>
 #include <sstream>
+#include <variant>
 
 #include <nlohmann/json.hpp>
 
 namespace nix {
+
+void BinaryCacheStoreConfig::anchor() {}
+
+void BinaryCacheStore::anchor() {}
+
+void NoSuchBinaryCacheFile::anchor() {}
 
 BinaryCacheStore::BinaryCacheStore(Config & config)
     : config{config}
@@ -136,8 +142,7 @@ void BinaryCacheStore::writeNarInfo(ref<NarInfo> narInfo)
             std::shared_ptr<NarInfo>(narInfo));
 }
 
-ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
-    Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo)
+ref<NarInfo> BinaryCacheStore::uploadData(Source & narSource, RepairFlag repair, fun<ValidPathInfo(HashResult)> mkInfo)
 {
     auto fdTemp = createAnonymousTempFile();
 
@@ -152,8 +157,10 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
     {
         FdSink fileSink(fdTemp.get());
         TeeSink teeSinkCompressed{fileSink, fileHashSink};
-        auto compressionSink = makeCompressionSink(
-            config.compression, teeSinkCompressed, config.parallelCompression, config.compressionLevel);
+        bool parallel = config.parallelCompression.overridden ? config.parallelCompression.get()
+                                                              : config.compression.get() == CompressionAlgo::zstd;
+        auto compressionSink =
+            makeCompressionSink(config.compression, teeSinkCompressed, parallel, config.compressionLevel);
         TeeSink teeSinkUncompressed{*compressionSink, narHashSink};
         TeeSource teeSource{narSource, teeSinkUncompressed};
         narAccessor = makeNarAccessor(parseNarListing(teeSource));
@@ -165,7 +172,7 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
 
     auto info = mkInfo(narHashSink.finish());
     auto narInfo = make_ref<NarInfo>(info);
-    narInfo->compression = config.compression.to_string(); // FIXME: Make NarInfo use CompressionAlgo
+    narInfo->compression = config.compression;
     auto [fileHash, fileSize] = fileHashSink.finish();
     narInfo->fileHash = fileHash;
     narInfo->fileSize = fileSize;
@@ -186,19 +193,6 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
         info.narSize,
         ((1.0 - (double) fileSize / info.narSize) * 100.0),
         duration);
-
-    /* Verify that all references are valid. This may do some .narinfo
-       reads, but typically they'll already be cached. */
-    for (auto & ref : info.references)
-        try {
-            if (ref != info.path)
-                queryPathInfo(ref);
-        } catch (InvalidPath &) {
-            throw Error(
-                "cannot add '%s' to the binary cache because the reference '%s' is not valid",
-                printStorePath(info.path),
-                printStorePath(ref));
-        }
 
     /* Optionally write a JSON file containing a listing of the
        contents of the NAR. */
@@ -280,24 +274,45 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
     stats.narWriteCompressedBytes += fileSize;
     stats.narWriteCompressionTimeMs += duration;
 
+    return narInfo;
+}
+
+void BinaryCacheStore::uploadNarInfo(ref<NarInfo> narInfo)
+{
+    /* Verify that all references are valid. This may do some .narinfo
+       reads, but typically they'll already be cached. */
+    for (auto & ref : narInfo->references)
+        try {
+            if (ref != narInfo->path)
+                queryPathInfo(ref);
+        } catch (InvalidPath &) {
+            throw Error(
+                "cannot add '%s' to the binary cache because the reference '%s' is not valid",
+                printStorePath(narInfo->path),
+                printStorePath(ref));
+        }
+
     narInfo->sign(*this, signers);
 
     /* Atomically write the NAR info file.*/
     writeNarInfo(narInfo);
 
     stats.narInfoWrite++;
+}
 
+ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
+    Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo)
+{
+    auto narInfo = uploadData(narSource, repair, std::move(mkInfo));
+    uploadNarInfo(narInfo);
     return narInfo;
 }
 
 void BinaryCacheStore::addToStore(
     const ValidPathInfo & info, Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs)
 {
-    if (!repair && isValidPath(info.path)) {
-        // FIXME: copyNAR -> null sink
-        narSource.drain();
+    if (!repair && isValidPath(info.path))
         return;
-    }
 
     addToStoreCommon(narSource, repair, checkSigs, {[&](HashResult nar) {
                          /* FIXME reinstate these, once we can correctly do hash modulo sink as
@@ -306,6 +321,137 @@ void BinaryCacheStore::addToStore(
                          // assert(info.narSize == nar.second);
                          return info;
                      }});
+}
+
+void BinaryCacheStore::addMultipleToStore(
+    PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs)
+{
+    /* Index the paths to copy by store path so the graph nodes below
+       can look up each path's info (NAR size, references) and source. */
+    std::map<StorePath, std::pair<ValidPathInfo, std::unique_ptr<Source>> *> infosMap;
+    uint64_t bytesExpected = 0;
+    for (auto & item : pathsToCopy) {
+        bytesExpected += item.first.narSize;
+        infosMap.insert_or_assign(item.first.path, &item);
+    }
+    act.setExpected(actCopyPath, bytesExpected);
+
+    std::atomic<size_t> nrDone{0};
+    std::atomic<uint64_t> nrRunning{0};
+    auto showProgress = [&, nrTotal = pathsToCopy.size()]() { act.progress(nrDone, nrTotal, nrRunning); };
+
+    /* The NarInfos produced by uploading the NARs, to be consumed when
+       writing the .narinfo files. Populated by the `UploadNar` nodes
+       and read by the corresponding `UploadNarInfo` nodes. */
+    Sync<std::map<StorePath, ref<NarInfo>>> narInfos_;
+
+    /* The work graph has two kinds of nodes: uploading the NAR for a
+       path (which has no dependencies, since NARs are independent of
+       each other), and uploading the .narinfo for a path (which depends
+       on the corresponding NAR upload and on the .narinfo uploads of all
+       the path's references). Processing the latter in topological order
+       maintains the closure invariant: whenever a .narinfo exists, the
+       .narinfo files of all its references exist as well. */
+    struct UploadNar
+    {
+        StorePath path;
+        uint64_t narSize;
+
+        /* Order NAR uploads by descending size so that the largest
+           (and typically slowest) NARs are started first. */
+        bool operator<(const UploadNar & other) const
+        {
+            return narSize != other.narSize ? narSize > other.narSize : path < other.path;
+        }
+    };
+
+    struct UploadNarInfo
+    {
+        StorePath path;
+
+        bool operator<(const UploadNarInfo & other) const
+        {
+            return path < other.path;
+        }
+    };
+
+    /* `std::variant`'s `operator<` orders by alternative index first, so
+       all `UploadNar` nodes sort (and thus get enqueued) before any
+       `UploadNarInfo` node.
+       TODO: uploading the debug info and NAR listings could be turned into separate graph nodes as well.
+       */
+    using Node = std::variant<UploadNar, UploadNarInfo>;
+
+    std::set<Node> nodes;
+    for (auto & [path, item] : infosMap) {
+        nodes.insert(UploadNar{path, item->first.narSize});
+        nodes.insert(UploadNarInfo{path});
+    }
+
+    processGraph<Node>(
+        nodes,
+
+        [&](const Node & node) -> std::set<Node> {
+            return std::visit(
+                overloaded{
+                    [&](const UploadNar &) -> std::set<Node> {
+                        /* NAR uploads have no dependencies. */
+                        return {};
+                    },
+                    [&](const UploadNarInfo & n) -> std::set<Node> {
+                        std::set<Node> edges;
+                        auto & info = infosMap.at(n.path)->first;
+                        /* Wait for our own NAR to be uploaded ... */
+                        edges.insert(UploadNar{n.path, info.narSize});
+                        /* ... and for the .narinfo files of all
+                           references that are part of this copy (other
+                           references are already valid in the store). */
+                        for (auto & ref : info.references) {
+                            if (ref != n.path && infosMap.count(ref))
+                                edges.insert(UploadNarInfo{ref});
+                        }
+                        return edges;
+                    },
+                },
+                node);
+        },
+
+        [&](const Node & node) {
+            checkInterrupt();
+            std::visit(
+                overloaded{
+                    [&](const UploadNar & n) {
+                        auto & [info, source_] = *infosMap.at(n.path);
+
+                        /* Make sure the Source object is destroyed when
+                           we're done, e.g. to release the connection
+                           lock held by LegacySSHStore::narFromPath(). */
+                        auto source = std::move(source_);
+
+                        if (repair || !isValidPath(info.path)) {
+                            MaintainCount<decltype(nrRunning)> mc(nrRunning);
+                            showProgress();
+                            auto narInfo = uploadData(*source, repair, [&](HashResult nar) {
+                                auto info2 = info;
+                                info2.ultimate = false;
+                                return info2;
+                            });
+                            narInfos_.lock()->insert_or_assign(info.path, narInfo);
+                        }
+
+                        nrDone++;
+                        showProgress();
+                    },
+                    [&](const UploadNarInfo & n) {
+                        auto & info = infosMap.at(n.path)->first;
+                        if (!repair && isValidPath(info.path))
+                            return;
+                        auto narInfo = narInfos_.lock()->at(n.path);
+                        uploadNarInfo(narInfo);
+                    },
+                },
+                node);
+        });
 }
 
 StorePath BinaryCacheStore::addToStoreFromDump(
@@ -419,7 +565,13 @@ void BinaryCacheStore::narFromPath(const StorePath & storePath, Sink & sink)
             stats.narReadBytes += narSize;
         }};
 
-    auto decompressor = makeDecompressionSink(info->compression, uncompressedSink);
+    /* makeDecompressionSink used to treat empty strings as "none". It seems
+       impossible that it would actually end up here with an empty string though
+       (since an empty `Compression: ' is treated as bzip2 when parsed from a
+       .narinfo file and the narinfo disk cache wouldn't handle empty strings).
+       TODO: Revisit this and convert to an assert probably or even made
+       compression a non-optional field. */
+    auto decompressor = makeDecompressionSink(info->compression.value_or(CompressionAlgo::none), uncompressedSink);
 
     try {
         getFile(info->url, *decompressor);

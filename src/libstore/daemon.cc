@@ -3,7 +3,6 @@
 #include "nix/store/worker-protocol.hh"
 #include "nix/store/worker-protocol-connection.hh"
 #include "nix/store/worker-protocol-impl.hh"
-#include "nix/store/build-result.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/store-cast.hh"
 #include "nix/store/filetransfer.hh"
@@ -16,9 +15,9 @@
 #include "nix/util/archive.hh"
 #include "nix/store/derivations.hh"
 #include "nix/util/args.hh"
-#include "nix/util/git.hh"
 #include "nix/util/logging.hh"
 #include "nix/store/globals.hh"
+#include <variant>
 
 #ifndef _WIN32 // TODO need graceful async exit support on Windows?
 #  include "nix/util/monitor-fd.hh"
@@ -42,6 +41,8 @@ Sink & operator<<(Sink & sink, const Logger::Fields & fields)
     }
     return sink;
 }
+
+namespace {
 
 /* Logger that forwards log messages to the client, *if* we're in a
    state where the protocol allows it (i.e., when canSendStderr is
@@ -180,22 +181,6 @@ struct TunnelLogger : public Logger
     }
 };
 
-struct TunnelSink : Sink
-{
-    Sink & to;
-
-    TunnelSink(Sink & to)
-        : to(to)
-    {
-    }
-
-    void operator()(std::string_view data) override
-    {
-        to << STDERR_WRITE;
-        writeString(data, to);
-    }
-};
-
 struct TunnelSource : BufferedSource
 {
     Source & from;
@@ -217,6 +202,8 @@ struct TunnelSource : BufferedSource
         return n;
     }
 };
+
+} // namespace
 
 struct ClientSettings
 {
@@ -510,7 +497,19 @@ static void performOp(
         logger->startWork();
         {
             FramedSource source(conn.from);
-            store->addMultipleToStore(source, RepairFlag{repair}, dontCheckSigs ? NoCheckSigs : CheckSigs);
+            auto expected = readNum<uint64_t>(source);
+            for (uint64_t i = 0; i < expected; ++i) {
+                auto info = WorkerProto::Serialise<ValidPathInfo>::read(
+                    *store,
+                    WorkerProto::ReadConn{
+                        .from = source,
+                        .version = {.number = {.major = 1, .minor = 16}},
+                    });
+                info.ultimate = false;
+                EnsureRead wrapper{source, info.narSize};
+                store->addToStore(info, wrapper, RepairFlag{repair}, dontCheckSigs ? NoCheckSigs : CheckSigs);
+                wrapper.finish();
+            }
         }
         logger->stopWork();
         break;
@@ -735,12 +734,30 @@ static void performOp(
     case WorkerProto::Op::CollectGarbage: {
         GCOptions options;
         options.action = WorkerProto::Serialise<GCOptions::GCAction>::read(*store, rconn);
-        options.pathsToDelete = WorkerProto::Serialise<StorePathSet>::read(*store, rconn);
+        if (rconn.version.features.contains(WorkerProto::featureDeleteDeadSpecificReferrers)) {
+            options.pathsToDelete = WorkerProto::Serialise<GCOptions::GCPaths>::read(*store, rconn);
+        } else {
+            auto paths = WorkerProto::Serialise<StorePathSet>::read(*store, rconn);
+            if (options.action != GCAction::gcDeleteSpecific && paths.empty())
+                options.pathsToDelete = GCOptions::WholeStore{};
+            else
+                options.pathsToDelete = GCOptions::SpecificPaths{
+                    .paths = paths,
+                    .deleteReferrers = false,
+                };
+        }
         conn.from >> options.ignoreLiveness >> options.maxFreed;
         // obsolete fields
         readInt(conn.from);
         readInt(conn.from);
         readInt(conn.from);
+
+        if (options.action == GCAction::gcDeleteDead
+            && std::holds_alternative<GCOptions::SpecificPaths>(options.pathsToDelete)
+            && !conn.protoVersion.features.contains(WorkerProto::featureDeleteDeadSpecificReferrers)) {
+            throw Error(
+                "Garbage collecting specific paths requested but it is not supported by the negotiated protocol");
+        }
 
         GCResults results;
 
@@ -934,8 +951,9 @@ static void performOp(
 
             logger->startWork();
 
-            // FIXME: race if addToStore doesn't read source?
-            store->addToStore(info, *source, (RepairFlag) repair, dontCheckSigs ? NoCheckSigs : CheckSigs);
+            EnsureRead wrapper{*source, info.narSize};
+            store->addToStore(info, wrapper, (RepairFlag) repair, dontCheckSigs ? NoCheckSigs : CheckSigs);
+            wrapper.finish();
 
             logger->stopWork();
         }
@@ -966,7 +984,10 @@ static void performOp(
     case WorkerProto::Op::QueryRealisation: {
         logger->startWork();
         auto outputId = WorkerProto::Serialise<DrvOutput>::read(*store, rconn);
-        std::optional<UnkeyedRealisation> info = *store->queryRealisation(outputId);
+        auto ptr = store->queryRealisation(outputId);
+        std::optional<UnkeyedRealisation> info;
+        if (ptr)
+            info = *ptr;
         logger->stopWork();
         /* Only return the new format because if we got past
            `DrvOutput` serialization, we know that is what we're using.
@@ -1017,8 +1038,12 @@ void processConnection(ref<Store> store, FdSource && from, FdSink && to, Trusted
 #endif
 
     /* Exchange the greeting. */
+    auto localVersion = WorkerProto::latest;
+    if (recursive)
+        localVersion.features.insert(std::string{WorkerProto::featureDisableSetOptions});
+
     WorkerProto::BasicServerConnection conn;
-    conn.protoVersion = WorkerProto::BasicServerConnection::handshake(to, from, WorkerProto::latest);
+    conn.protoVersion = WorkerProto::BasicServerConnection::handshake(to, from, localVersion);
 
     if (conn.protoVersion.number < WorkerProto::minimum.number)
         throw Error("the Nix client version is too old");
@@ -1026,14 +1051,11 @@ void processConnection(ref<Store> store, FdSource && from, FdSink && to, Trusted
     conn.to = std::move(to);
     conn.from = std::move(from);
 
-    auto tunnelLogger_ = std::make_unique<TunnelLogger>(conn.to, conn.protoVersion);
-    auto tunnelLogger = tunnelLogger_.get();
-    std::unique_ptr<Logger> prevLogger_;
-    auto prevLogger = logger.get();
+    auto tunnelLogger = new TunnelLogger(conn.to, conn.protoVersion);
+    auto prevLogger = logger;
     // FIXME
     if (!recursive) {
-        prevLogger_ = std::move(logger);
-        logger = std::move(tunnelLogger_);
+        logger = tunnelLogger;
         applyJSONLogger();
     }
 

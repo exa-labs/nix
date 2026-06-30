@@ -16,6 +16,20 @@ in
 scope: {
   inherit stdenv;
 
+  mimalloc =
+    if lib.versionAtLeast pkgs.mimalloc.version "3.3.2" then
+      pkgs.mimalloc
+    else
+      pkgs.mimalloc.overrideAttrs rec {
+        version = "3.3.2";
+        src = pkgs.fetchFromGitHub {
+          owner = "microsoft";
+          repo = "mimalloc";
+          tag = "v${version}";
+          hash = "sha256-GZ37qQVDe9jgMb4Coe5oKvgaLTspZDlSkS5rdy1MfUU=";
+        };
+      };
+
   boehmgc =
     (pkgs.boehmgc.override {
       enableLargeConfig = true;
@@ -30,23 +44,38 @@ scope: {
         NIX_CFLAGS_COMPILE = "-DINITIAL_MARK_STACK_SIZE=1048576";
       });
 
-  curl =
-    (pkgs.curl.override {
-      http3Support = !pkgs.stdenv.hostPlatform.isWindows;
-      # Make sure we enable all the dependencies for Content-Encoding/Transfer-Encoding decompression.
-      zstdSupport = true;
-      brotliSupport = true;
-      zlibSupport = true;
-    }).overrideAttrs
-      {
-        # TODO: Fix in nixpkgs. Static build with brotli is marked as broken, but it's not the case.
-        # Remove once https://github.com/NixOS/nixpkgs/pull/494111 lands in the 25.11 channel.
-        meta.broken = false;
-      };
+  curl = pkgs.curl.override {
+    http3Support = !pkgs.stdenv.hostPlatform.isWindows;
+    # Make sure we enable all the dependencies for Content-Encoding/Transfer-Encoding decompression.
+    zstdSupport = true;
+    brotliSupport = true;
+    zlibSupport = true;
+  };
 
   libblake3 = pkgs.libblake3.override {
-    useTBB = !(stdenv.hostPlatform.isWindows || stdenv.hostPlatform.isStatic);
+    useTBB =
+      !(
+        stdenv.hostPlatform.isWindows
+        || stdenv.hostPlatform.isStatic
+        # Some tbb tests fail with libc++.
+        || (stdenv.cc.libcxx != null && stdenv.cc.libcxx.isLLVM)
+      );
   };
+
+  libgit2 =
+    if lib.versionAtLeast pkgs.libgit2.version "1.9.4" then
+      pkgs.libgit2
+    else
+      # Grab newer libgit2.
+      pkgs.libgit2.overrideAttrs rec {
+        version = "1.9.4";
+        src = pkgs.fetchFromGitHub {
+          owner = "libgit2";
+          repo = "libgit2";
+          tag = "v${version}";
+          hash = "sha256-ZKUiz3pdFE2SKxh53X2oyr7hs32Njj5YVA0OXDXz7h0=";
+        };
+      };
 
   # TODO Hack until https://github.com/NixOS/nixpkgs/issues/45462 is fixed.
   boost =

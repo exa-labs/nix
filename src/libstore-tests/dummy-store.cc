@@ -6,6 +6,7 @@
 #include "nix/store/globals.hh"
 #include "nix/store/realisation.hh"
 
+#include "nix/store/tests/libstore.hh"
 #include "nix/util/tests/json-characterization.hh"
 
 namespace nix {
@@ -55,9 +56,19 @@ TEST(DummyStore, storeDir_empty_rejected)
     EXPECT_THROW((DummyStoreConfig{{{"store", ""}}}), UsageError);
 }
 
+TEST(DummyStore, getStateDir_default)
+{
+    // DummyStore uses the base StoreConfig::getStateDir which returns
+    // the global settings.nixStateDir
+    DummyStoreConfig config{{}};
+    EXPECT_EQ(config.getStateDir(), settings.nixStateDir);
+}
+
 TEST(DummyStore, realisation_read)
 {
     initLibStore(/*loadConfig=*/false);
+
+    EnableExperimentalFeature enableCA{"ca-derivations"};
 
     auto store = [] {
         auto cfg = make_ref<DummyStoreConfig>(StoreReference::Params{});

@@ -75,7 +75,7 @@ static NarInfo makeNarInfo(const Store & store, bool includeImpureInfo)
         };
 
         info.url = "nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.xz";
-        info.compression = "xz";
+        info.compression = CompressionAlgo::xz;
         info.fileHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
         info.fileSize = 4029176;
     }
@@ -168,5 +168,17 @@ JSON_TEST_V2(impure, true)
 
 JSON_TEST_V3(pure, false)
 JSON_TEST_V3(impure, true)
+
+#undef JSON_TEST_V1
+#undef JSON_READ_TEST_V1
+#undef JSON_WRITE_TEST_V1
+
+#undef JSON_TEST_V2
+#undef JSON_READ_TEST_V2
+#undef JSON_WRITE_TEST_V2
+
+#undef JSON_TEST_V3
+#undef JSON_READ_TEST_V3
+#undef JSON_WRITE_TEST_V3
 
 } // namespace nix

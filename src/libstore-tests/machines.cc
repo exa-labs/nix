@@ -2,18 +2,18 @@
 #include "nix/util/file-system.hh"
 #include "nix/util/util.hh"
 
-#include "nix/util/tests/characterization.hh"
+#include "nix/util/tests/test-data.hh"
 
 #include <gtest/gtest.h>
 #include <gmock/gmock-matchers.h>
 
-using testing::Contains;
-using testing::ElementsAre;
-using testing::Eq;
-using testing::Field;
-using testing::SizeIs;
+using ::testing::Contains;
+using ::testing::ElementsAre;
+using ::testing::Eq;
+using ::testing::Field;
+using ::testing::SizeIs;
 
-using namespace nix;
+namespace nix {
 
 TEST(machines, getMachinesWithEmptyBuilders)
 {
@@ -210,3 +210,5 @@ TEST(machines, getMachinesWithCorrectFileReferenceToIncorrectFile)
             {}, "@" + std::filesystem::weakly_canonical(getUnitTestData() / "machines" / "bad_format").string()),
         FormatError);
 }
+
+} // namespace nix

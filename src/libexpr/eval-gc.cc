@@ -1,8 +1,6 @@
-#include "nix/util/error.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/util/config-global.hh"
-#include "nix/util/serialise.hh"
 #include "nix/expr/eval-gc.hh"
 #include "nix/expr/value.hh"
 
@@ -75,6 +73,21 @@ static inline void initGCReal()
             GC_register_displacement(i);
 
     GC_set_oom_fn(oomHandler);
+
+    /* Funnel boehm warnings into debug logs. */
+    GC_set_warn_proc([](char * msg, GC_word word) noexcept {
+        std::array<char, 4096> buffer{};
+        auto res = snprintf(buffer.data(), buffer.size(), msg, word);
+        /* Ignore garbage. */
+        if (res < 0)
+            return;
+
+        try {
+            debug("%s", chomp(std::string_view(buffer.data(), std::min<size_t>(res, buffer.size() - 1))));
+        } catch (...) {
+            /* Swallow all errors. */
+        }
+    });
 
     /* Tell the GC to expand the heap aggressively instead of
        collecting frequently.  The default free_space_divisor is 3,

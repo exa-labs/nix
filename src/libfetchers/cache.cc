@@ -26,6 +26,8 @@ create table if not exists Cache (
 
 struct CacheImpl : Cache
 {
+    void anchor() override;
+
     struct State
     {
         SQLite db;
@@ -60,7 +62,11 @@ struct CacheImpl : Cache
     void upsert(const Key & key, const Attrs & value) override
     {
         _state.lock()
-            ->upsert.use()(key.first)(attrsToJSON(key.second).dump())(attrsToJSON(value).dump())(time(nullptr))
+            ->upsert.use()
+            .apply(key.first)
+            .apply(attrsToJSON(key.second).dump())
+            .apply(attrsToJSON(value).dump())
+            .apply(time(nullptr))
             .exec();
     }
 
@@ -87,7 +93,7 @@ struct CacheImpl : Cache
 
         auto keyJSON = attrsToJSON(key.second).dump();
 
-        auto stmt(state->lookup.use()(key.first)(keyJSON));
+        auto stmt(state->lookup.use().apply(key.first).apply(keyJSON));
         if (!stmt.next()) {
             debug("did not find cache entry for '%s:%s'", key.first, keyJSON);
             return {};
@@ -155,6 +161,10 @@ struct CacheImpl : Cache
         return res && !res->expired ? res : std::nullopt;
     }
 };
+
+void Cache::anchor() {}
+
+void CacheImpl::anchor() {}
 
 ref<Cache> Settings::getCache() const
 {

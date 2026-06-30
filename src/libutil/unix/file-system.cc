@@ -37,7 +37,7 @@ AutoCloseFD openFileReadonly(const std::filesystem::path & path, FinalSymlink fi
 
 AutoCloseFD openNewFileForWrite(const std::filesystem::path & path, mode_t mode, OpenNewFileForWriteParams params)
 {
-    auto flags = O_WRONLY | O_CREAT | O_CLOEXEC;
+    auto flags = (params.writeOnly ? O_WRONLY : O_RDWR) | O_CREAT | O_CLOEXEC;
     if (params.truncateExisting) {
         flags |= O_TRUNC;
         if (!params.followSymlinksOnTruncate)
@@ -75,7 +75,7 @@ std::filesystem::path descriptorToPath(Descriptor fd)
 
 std::filesystem::path defaultTempDir()
 {
-    return getEnvNonEmpty("TMPDIR").value_or("/tmp");
+    return getEnvOsNonEmpty("TMPDIR").value_or("/tmp");
 }
 
 PosixStat lstat(const std::filesystem::path & path)
@@ -169,12 +169,10 @@ static void _deletePath(
 
     auto name = CanonPath::fromFilename(path.filename().native());
 
-    PosixStat st;
-    if (fstatat(parentfd, name.rel_c_str(), &st, AT_SYMLINK_NOFOLLOW) == -1) {
-        if (errno == ENOENT)
-            return;
-        throw SysError("getting status of %1%", PathFmt(path));
-    }
+    auto st_ = maybeFstatat(parentfd, name.rel());
+    if (!st_)
+        return;
+    auto & st = *st_;
 
     if (!S_ISDIR(st.st_mode)) {
         /* We are about to delete a file. Will it likely free space? */
@@ -213,7 +211,7 @@ static void _deletePath(
                 throw;
             }
 
-        int fd = openat(parentfd, name.rel_c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        int fd = openat(parentfd, name.rel_c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (fd == -1)
             throw SysError("opening directory %1%", PathFmt(path));
         AutoCloseDir dir(fdopendir(fd));
@@ -291,6 +289,12 @@ void deletePath(const std::filesystem::path & path, uint64_t & bytesFreed)
 #endif
     bytesFreed = 0;
     _deletePath(path, bytesFreed MOUNTEDPATHS_ARG);
+}
+
+void chown(const std::filesystem::path & path, uid_t owner, gid_t group)
+{
+    if (::chown(path.c_str(), owner, group) == -1)
+        throw SysError("changing ownership of %s", PathFmt(path));
 }
 
 } // namespace nix

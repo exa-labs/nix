@@ -1,7 +1,7 @@
 {
   description = "The purely functional package manager";
 
-  inputs.nixpkgs.url = "https://channels.nixos.org/nixos-25.11/nixexprs.tar.xz";
+  inputs.nixpkgs.url = "https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz";
 
   inputs.nixpkgs-regression.url = "github:NixOS/nixpkgs/215d4d0fd80ca5163643b03a33fde804a29cc1e2";
   inputs.nixpkgs-23-11.url = "github:NixOS/nixpkgs/a62e6edd6d5e1fa0329b8653c801147986f8d446";
@@ -16,7 +16,6 @@
   # work around https://github.com/NixOS/nix/issues/7730
   inputs.flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
   inputs.git-hooks-nix.inputs.nixpkgs.follows = "nixpkgs";
-  inputs.git-hooks-nix.inputs.nixpkgs-stable.follows = "nixpkgs";
   # work around 7730 and https://github.com/NixOS/nix/issues/7807
   inputs.git-hooks-nix.inputs.flake-compat.follows = "";
   inputs.git-hooks-nix.inputs.gitignore.follows = "";
@@ -113,11 +112,8 @@
                     {
                       config = crossSystem;
                     }
-                    // lib.optionalAttrs (crossSystem == "x86_64-unknown-freebsd13") {
-                      useLLVM = true;
-                    }
                     // lib.optionalAttrs (crossSystem == "x86_64-w64-mingw32") {
-                      emulator = pkgs: "${pkgs.buildPackages.wineWow64Packages.stable_11}/bin/wine";
+                      emulator = pkgs: "${pkgs.buildPackages.wineWow64Packages.stable}/bin/wine";
                     };
                 overlays = [
                   (overlayFor (pkgs: pkgs.${stdenv}))
@@ -331,12 +327,6 @@
         // (lib.optionalAttrs (builtins.elem system linux64BitSystems)) {
           dockerImage = self.hydraJobs.dockerImage.${system};
         }
-        // (lib.optionalAttrs (!(builtins.elem system linux32BitSystems))) {
-          # Some perl dependencies are broken on i686-linux.
-          # Since the support is only best-effort there, disable the perl
-          # bindings
-          perlBindings = self.hydraJobs.perlBindings.${system};
-        }
         # Add "passthru" tests
         //
           flatMapAttrs
@@ -425,10 +415,6 @@
                 supportsCross = false;
               };
 
-              "nix-perl-bindings" = {
-                supportsCross = false;
-              };
-
               "nix-clang-tidy-plugin" = {
                 supportsCross = false;
               };
@@ -469,6 +455,9 @@
                 )
               )
             )
+        // lib.optionalAttrs (self.hydraJobs.rustInstaller ? ${system}) {
+          rustInstaller = self.hydraJobs.rustInstaller.${system};
+        }
         // lib.optionalAttrs (builtins.elem system linux64BitSystems) {
           dockerImage =
             let
@@ -512,6 +501,16 @@
       devShells =
         let
           makeShell = import ./packaging/dev-shell.nix { inherit lib devFlake; };
+          makeShell' =
+            { pkgs }:
+            makeShell {
+              inherit pkgs;
+              nixComponents = pkgs.nixComponents2.overrideScope (
+                finalScope: prevScope: {
+                  withUnityBuild = false;
+                }
+              );
+            };
           prefixAttrs = prefix: lib.concatMapAttrs (k: v: { "${prefix}-${k}" = v; });
         in
         forAllSystems (
@@ -519,7 +518,7 @@
           prefixAttrs "native" (
             forAllStdenvs (
               stdenvName:
-              makeShell {
+              makeShell' {
                 pkgs = nixpkgsFor.${system}.nativeForStdenv.${stdenvName};
               }
             )
@@ -528,7 +527,7 @@
             prefixAttrs "static" (
               forAllStdenvs (
                 stdenvName:
-                makeShell {
+                makeShell' {
                   pkgs = nixpkgsFor.${system}.nativeForStdenv.${stdenvName}.pkgsStatic;
                 }
               )
@@ -536,7 +535,7 @@
             // prefixAttrs "llvm" (
               forAllStdenvs (
                 stdenvName:
-                makeShell {
+                makeShell' {
                   pkgs = nixpkgsFor.${system}.nativeForStdenv.${stdenvName}.pkgsLLVM;
                 }
               )
@@ -544,7 +543,7 @@
             // prefixAttrs "cross" (
               forAllCrossSystems (
                 crossSystem:
-                makeShell {
+                makeShell' {
                   pkgs = nixpkgsFor.${system}.cross.${crossSystem};
                 }
               )

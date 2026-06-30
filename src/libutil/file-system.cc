@@ -1,4 +1,3 @@
-#include "nix/util/environment-variables.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/file-path.hh"
 #include "nix/util/file-path-impl.hh"
@@ -96,7 +95,8 @@ absPath(const std::filesystem::path & path0, const std::filesystem::path * dir, 
 
 std::filesystem::path canonPath(const std::filesystem::path & path, bool resolveSymlinks)
 {
-    assert(!path.empty());
+    if (path.empty())
+        throw Error("cannot canonicalise an empty path");
 
     if (!path.is_absolute())
         throw Error("not an absolute path: %s", PathFmt(path));
@@ -394,7 +394,7 @@ void createDir(const std::filesystem::path & path, mode_t mode)
 void createDirs(const std::filesystem::path & path)
 {
     try {
-        std::filesystem::create_directories(path);
+        std::filesystem::create_directories(path); // NOLINT(bugprone-unsafe-functions)
     } catch (std::filesystem::filesystem_error & e) {
         throw SystemError(e.code(), "creating directory %1%", PathFmt(path));
     }
@@ -462,7 +462,7 @@ std::filesystem::path createTempDir(const std::filesystem::path & tmpRoot, const
                will be owned by "wheel"; but if the user is not in
                "wheel", then "tar" will fail to unpack archives that
                have the setgid bit set on directories. */
-            if (chown(tmpDir.c_str(), (uid_t) -1, getegid()) != 0)
+            if (::chown(tmpDir.c_str(), (uid_t) -1, getegid()) != 0)
                 throw SysError("setting group of directory %1%", PathFmt(tmpDir));
 #endif
             return tmpDir;
@@ -515,10 +515,11 @@ AutoCloseFD createAnonymousTempFile()
     return fd;
 }
 
-std::pair<AutoCloseFD, std::filesystem::path> createTempFile(const std::filesystem::path & prefix)
+std::pair<AutoCloseFD, std::filesystem::path>
+createTempFile(const std::filesystem::path & root, const std::filesystem::path & prefix)
 {
     assert(!prefix.is_absolute());
-    auto tmpl = (defaultTempDir() / (prefix.string() + ".XXXXXX")).string();
+    auto tmpl = (root / (prefix.string() + ".XXXXXX")).string();
     // FIXME: use O_TMPFILE.
     // `mkstemp` modifies the string to contain the actual filename.
     AutoCloseFD fd = toDescriptor(mkstemp(tmpl.data()));
@@ -529,6 +530,11 @@ std::pair<AutoCloseFD, std::filesystem::path> createTempFile(const std::filesyst
     unix::closeOnExec(fd.get());
 #endif
     return {std::move(fd), std::filesystem::path(std::move(tmpl))};
+}
+
+std::pair<AutoCloseFD, std::filesystem::path> createTempFile(const std::filesystem::path & prefix)
+{
+    return createTempFile(defaultTempDir(), prefix);
 }
 
 std::filesystem::path makeTempPath(const std::filesystem::path & root, const std::string & suffix)
@@ -661,21 +667,6 @@ bool isExecutableFileAmbient(const std::filesystem::path & exe)
                   == 0;
 }
 
-std::filesystem::path makeParentCanonical(const std::filesystem::path & rawPath)
-{
-    std::filesystem::path path(absPath(rawPath));
-    try {
-        auto parent = path.parent_path();
-        if (parent == path) {
-            // `path` is a root directory => trivially canonical
-            return parent;
-        }
-        return std::filesystem::canonical(parent) / path.filename();
-    } catch (std::filesystem::filesystem_error & e) {
-        throw SystemError(e.code(), "canonicalising parent path of %1%", PathFmt(path));
-    }
-}
-
 void chmod(const std::filesystem::path & path, mode_t mode)
 {
     if (
@@ -694,6 +685,14 @@ void chmod(const std::filesystem::path & path, mode_t mode)
 #else
 #  define UNLINK_PROC ::unlink
 #endif
+
+void unlinkIfExists(const std::filesystem::path & path)
+{
+    if (UNLINK_PROC(path.c_str()) == -1) {
+        if (errno != ENOENT)
+            throw SysError("removing %s", PathFmt(path));
+    }
+}
 
 void unlink(const std::filesystem::path & path)
 {

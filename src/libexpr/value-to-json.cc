@@ -4,7 +4,6 @@
 #include "nix/util/signals.hh"
 
 #include <cstdlib>
-#include <iomanip>
 #include <nlohmann/json.hpp>
 
 namespace nix {
@@ -104,6 +103,8 @@ json printValueAsJSON(
     }
     return out;
 }
+
+void JSONSerializationError::anchor() {}
 
 void printValueAsJSON(
     EvalState & state,

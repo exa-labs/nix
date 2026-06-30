@@ -10,6 +10,7 @@
 #include "nix/util/error.hh"
 #include "nix/util/json-non-null.hh"
 #include "nix/util/types.hh"
+#include "nix/util/fmt.hh"
 #include "nix/util/experimental-features.hh"
 
 namespace nix {
@@ -51,6 +52,11 @@ class AbstractSetting;
 
 class AbstractConfig
 {
+private:
+    /* VTable anchor to avoid weak linkage of the vtable - it breaks
+       dynamic_cast across shared libraries on Darwin. */
+    virtual void anchor();
+
 protected:
     StringMap unknownSettings;
 
@@ -139,6 +145,8 @@ public:
 class Config : public AbstractConfig
 {
     friend class AbstractSetting;
+
+    void anchor() override;
 
 public:
 
@@ -509,6 +517,9 @@ public:
         options->addSetting(this);
     }
 
+    /* To appease -Wweak-vtables. */
+    ~Setting() override;
+
     void operator=(const AbsolutePath & v)
     {
         this->assign(v);
@@ -520,12 +531,29 @@ public:
     }
 };
 
+/* Delete these overloads to avoid footguns with implicit quoting of Setting<AbsolutePath> in fmt(). */
+
+template<class F, typename... Args>
+inline void formatHelper(F & f, const AbsolutePath & x, const Args &... args) = delete;
+
+template<class F, typename... Args>
+inline void formatHelper(F & f, const AbsolutePath & x) = delete;
+
+template<class F, typename... Args>
+inline void formatHelper(F & f, const Setting<AbsolutePath> & x, const Args &... args) = delete;
+
+template<class F, typename... Args>
+inline void formatHelper(F & f, const Setting<AbsolutePath> & x) = delete;
+
 template<>
 void BaseSetting<std::set<std::filesystem::path>>::appendOrSet(std::set<std::filesystem::path> newValue, bool append);
 
 struct ExperimentalFeatureSettings : Config
 {
+private:
+    void anchor() override;
 
+public:
     Setting<std::set<ExperimentalFeature>> experimentalFeatures{
         this,
         {},
@@ -563,7 +591,7 @@ struct ExperimentalFeatureSettings : Config
      */
     template<typename GetReason>
         requires std::invocable<GetReason> && std::convertible_to<std::invoke_result_t<GetReason>, std::string>
-    void require(const ExperimentalFeature & feature, GetReason && getReason) const
+    void require(const ExperimentalFeature & feature, const GetReason & getReason) const
     {
         if (isEnabled(feature))
             return;
@@ -582,6 +610,12 @@ struct ExperimentalFeatureSettings : Config
      */
     void require(const std::optional<ExperimentalFeature> &) const;
 };
+
+#define NIX_DECLARE_CONFIG_SERIALISER(TY)                     \
+    template<>                                                \
+    TY BaseSetting<TY>::parse(const std::string & str) const; \
+    template<>                                                \
+    std::string BaseSetting<TY>::to_string() const;
 
 // FIXME: don't use a global variable.
 extern ExperimentalFeatureSettings experimentalFeatureSettings;

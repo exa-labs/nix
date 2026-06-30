@@ -12,6 +12,7 @@
 #include "nix/util/types.hh"
 #include "nix/util/file-descriptor.hh"
 #include "nix/util/file-path.hh"
+#include "nix/util/deleter.hh"
 
 #include <filesystem>
 #include <sys/types.h>
@@ -159,23 +160,6 @@ std::optional<PosixStat> maybeStat(const std::filesystem::path & path);
 bool pathExists(const std::filesystem::path & path);
 
 /**
- * Canonicalize a path except for the last component.
- *
- * This is useful for getting the canonical location of a symlink.
- *
- * Consider the case where `foo/l` is a symlink. `canonical("foo/l")` will
- * resolve the symlink `l` to its target.
- * `makeParentCanonical("foo/l")` will not resolve the symlink `l` to its target,
- * but does ensure that the returned parent part of the path, `foo` is resolved
- * to `canonical("foo")`, and can therefore be retrieved without traversing any
- * symlinks.
- *
- * If a relative path is passed, it will be made absolute, so that the parent
- * can always be canonicalized.
- */
-std::filesystem::path makeParentCanonical(const std::filesystem::path & path);
-
-/**
  * A version of pathExists that returns false on a permission error.
  * Useful for inferring default paths across directories that might not
  * be readable.
@@ -232,6 +216,10 @@ struct OpenNewFileForWriteParams
      * Whether to follow symlinks if @ref truncateExisting is true.
      */
     bool followSymlinksOnTruncate:1 = false;
+    /**
+     * Whether to open the newly created file as write-only.
+     */
+    bool writeOnly:1 = true;
 };
 
 /**
@@ -432,15 +420,7 @@ public:
     }
 };
 
-struct DIRDeleter
-{
-    void operator()(DIR * dir) const
-    {
-        closedir(dir);
-    }
-};
-
-typedef std::unique_ptr<DIR, DIRDeleter> AutoCloseDir;
+typedef std::unique_ptr<DIR, Deleter<closedir>> AutoCloseDir;
 
 /**
  * Create a temporary directory.
@@ -453,6 +433,12 @@ createTempDir(const std::filesystem::path & tmpRoot = "", const std::string & pr
  * On UNIX there resulting file isn't linked to any path on the filesystem.
  */
 AutoCloseFD createAnonymousTempFile();
+
+/**
+ * Create a temporary file at a root, returning a file handle and its path.
+ */
+std::pair<AutoCloseFD, std::filesystem::path>
+createTempFile(const std::filesystem::path & root, const std::filesystem::path & prefix);
 
 /**
  * Create a temporary file, returning a file handle and its path.
@@ -516,12 +502,30 @@ bool chmodIfNeeded(const std::filesystem::path & path, mode_t mode, mode_t mask 
  */
 void chmod(const std::filesystem::path & path, mode_t mode);
 
+#ifndef _WIN32
+/**
+ * Change ownership of a file, throwing an exception on error.
+ *
+ * @param path Path to the file to change the ownership for.
+ * @param owner New owner user ID.
+ * @param group New owner group ID.
+ */
+void chown(const std::filesystem::path & path, uid_t owner, gid_t group);
+#endif
+
 /**
  * Remove a file, throwing an exception on error.
  *
  * @param path Path to the file to remove.
  */
 void unlink(const std::filesystem::path & path);
+
+/**
+ * Remove a file, throwing an exception on error. ENOENT is ignored.
+ *
+ * @param path Path to the file to remove.
+ */
+void unlinkIfExists(const std::filesystem::path & path);
 
 /**
  * Try to remove a file, ignoring errors.

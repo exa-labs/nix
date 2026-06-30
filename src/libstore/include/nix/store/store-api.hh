@@ -78,6 +78,9 @@ struct MissingPaths
  */
 struct StoreConfigBase : Config
 {
+private:
+    void anchor() override;
+
 protected:
 
     /**
@@ -229,6 +232,10 @@ public:
  */
 struct StoreConfig : public StoreConfigBase, public StoreDirConfig
 {
+private:
+    void anchor() override;
+
+public:
     using Params = StoreReference::Params;
 
     StoreConfig(const Params & params, FilePathType pathType);
@@ -320,6 +327,24 @@ struct StoreConfig : public StoreConfigBase, public StoreDirConfig
     virtual bool getReadOnly() const;
 
     /**
+     * @return The state directory for this store.
+     *
+     * By default, returns the global `settings.nixStateDir`. Subclasses
+     * like `LocalFSStoreConfig` may override to return a store-specific
+     * state directory.
+     */
+    virtual const std::filesystem::path & getStateDir() const;
+
+    /**
+     * @return The log directory for this store.
+     *
+     * By default, returns the global log directory. Subclasses
+     * like `LocalFSStoreConfig` may override to return a store-specific
+     * log directory.
+     */
+    virtual const std::filesystem::path & getLogDir() const;
+
+    /**
      * Open a store of the type corresponding to this configuration
      * type.
      */
@@ -362,6 +387,10 @@ struct StoreConfig : public StoreConfigBase, public StoreDirConfig
  */
 class Store : public std::enable_shared_from_this<Store>, public StoreDirConfig
 {
+    /* VTable anchor to avoid weak linkage of the vtable - it breaks
+       dynamic_cast across shared libraries on Darwin. */
+    virtual void anchor() = 0;
+
 public:
 
     using Config = StoreConfig;
@@ -584,6 +613,12 @@ public:
     queryStaticPartialDerivationOutputMap(const StorePath & path);
 
     /**
+     * Like the above, but for a single output.
+     */
+    virtual std::optional<StorePath>
+    queryStaticPartialDerivationOutput(const StorePath & path, const std::string & outputName);
+
+    /**
      * Query the mapping outputName=>outputPath for the given derivation.
      * Assume every output has a mapping and throw an exception otherwise.
      */
@@ -610,7 +645,8 @@ public:
     virtual void querySubstitutablePathInfos(const StorePathCAMap & paths, SubstitutablePathInfos & infos);
 
     /**
-     * Import a path into the store.
+     * Import a path into the store. Note that the entire NAR may not be read from `narSource`, e.g. if the path is
+     * already valid.
      */
     virtual void addToStore(
         const ValidPathInfo & info,
@@ -627,8 +663,6 @@ public:
     /**
      * Import multiple paths into the store.
      */
-    virtual void addMultipleToStore(Source & source, RepairFlag repair = NoRepair, CheckSigsFlag checkSigs = CheckSigs);
-
     virtual void addMultipleToStore(
         PathsSource && pathsToCopy, Activity & act, RepairFlag repair = NoRepair, CheckSigsFlag checkSigs = CheckSigs);
 
@@ -783,6 +817,47 @@ public:
     /**
      * Add a store path as a temporary root of the garbage collector.
      * The root disappears as soon as we exit.
+     * Before exiting, if you want to avoid the path being GC'ed, you either have to make it a permanent root using
+     * `LocalFSStore::addPermRoot()`, or make sure it's reachable from a permanent root (e.g. by adding it as a
+     * reference of a reachable path).
+     *
+     * To avoid races, you should call either this function or `LocalFSStore::addPermRoot()` *before* creating and using
+     * a store path, e.g.
+     *
+     * ```c++
+     * auto path = store.computeStorePath(...);
+     * store->addTempRoot(path);
+     * if (!store->isValidPath(path))
+     *     store->addToStore(...);
+     * ```
+     *
+     * By contrast, registering a root just before *using* a path is not sufficient to prevent GC races. For
+     * instance, don't do this:
+     *
+     * ```c++
+     * store->addTempRoot(path);
+     * auto drv = store->readDerivation(path);
+     * ```
+     *
+     * since the path may be GC'ed just before the call to `addTempRoot()`.
+     *
+     * Note that `addToStore()` implicitly calls `addTempRoot()`, so you don't need to call it yourself if you're
+     * calling `addToStore()` unconditionally.
+     *
+     * It is generally the responsibility of the caller of Nix APIs and CLI tools to ensure that paths are reachable by
+     * the garbage collector. For example, `buildPath(drvPath)` does not need to register *drvPath* as a GC root, since
+     * that's the responsibility of the caller, and it would be too late for `buildPath()` to do so anyway. Thus, this
+     * can race:
+     * ```console
+     * drv=$(nix-instantiate foo.nix)
+     * nix-store -r $drv
+     * ```
+     * whereas this is safe:
+     * ```console
+     * nix-instantiate foo.nix --add-root ./drv
+     * nix-store -r ./drv
+     * ```
+     *
      */
     virtual void addTempRoot(const StorePath & path)
     {
@@ -1065,7 +1140,8 @@ void copyClosure(
     const std::set<RealisedPath> & paths,
     RepairFlag repair = NoRepair,
     CheckSigsFlag checkSigs = CheckSigs,
-    SubstituteFlag substitute = NoSubstitute);
+    SubstituteFlag substitute = NoSubstitute,
+    bool includeOutputs = false);
 
 void copyClosure(
     Store & srcStore,
@@ -1073,7 +1149,8 @@ void copyClosure(
     const StorePathSet & paths,
     RepairFlag repair = NoRepair,
     CheckSigsFlag checkSigs = CheckSigs,
-    SubstituteFlag substitute = NoSubstitute);
+    SubstituteFlag substitute = NoSubstitute,
+    bool includeOutputs = false);
 
 /**
  * Remove the temporary roots file for this process.  Any temporary

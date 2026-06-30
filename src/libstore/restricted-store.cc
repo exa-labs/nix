@@ -26,6 +26,8 @@ static StorePath pathPartOfReq(const DerivedPath & req)
         req.raw());
 }
 
+void RestrictionContext::anchor() {}
+
 bool RestrictionContext::isAllowed(const DerivedPath & req)
 {
     return isAllowed(pathPartOfReq(req));
@@ -38,6 +40,10 @@ bool RestrictionContext::isAllowed(const DerivedPath & req)
  */
 struct RestrictedStore : public virtual IndirectRootStore, public virtual GcStore
 {
+private:
+    void anchor() override;
+
+public:
     ref<const LocalStore::Config> config;
 
     ref<LocalStore> next;
@@ -157,6 +163,8 @@ struct RestrictedStore : public virtual IndirectRootStore, public virtual GcStor
     }
 };
 
+void RestrictedStore::anchor() {}
+
 ref<Store> makeRestrictedStore(ref<LocalStore::Config> config, ref<LocalStore> next, RestrictionContext & context)
 {
     return make_ref<RestrictedStore>(config, next, context);
@@ -167,8 +175,11 @@ StorePathSet RestrictedStore::queryAllValidPaths()
     StorePathSet paths;
     for (auto & p : goal.originalPaths())
         paths.insert(p);
-    for (auto & p : goal.addedPaths)
-        paths.insert(p);
+    for (auto & [p, future] : goal.state_.lock()->addedPaths) {
+        /* Only report the paths that have finished materialising in the sandbox. */
+        if (future.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            paths.insert(p);
+    }
     return paths;
 }
 
@@ -300,8 +311,12 @@ std::vector<KeyedBuildResult> RestrictedStore::buildPathsWithResults(
     next->computeFSClosure(newPaths, closure);
     for (auto & path : closure)
         goal.addDependency(path);
-    for (auto & real : newRealisations)
-        goal.addedDrvOutputs.insert(real.id);
+
+    {
+        auto state(goal.state_.lock());
+        for (auto & real : newRealisations)
+            state->addedDrvOutputs.insert(real.id);
+    }
 
     return results;
 }

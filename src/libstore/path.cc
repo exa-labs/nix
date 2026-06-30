@@ -6,6 +6,10 @@
 
 namespace nix {
 
+void BadStorePathName::anchor() {}
+
+void BadStorePath::anchor() {}
+
 void checkName(std::string_view name)
 {
     if (name.empty())

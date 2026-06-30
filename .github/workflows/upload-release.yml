@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       eval_id:
-        description: "Hydra evaluation ID"
+        description: "Hydra evaluation ID (from the maintenance-X.Y-release jobset)"
         required: true
         type: number
       is_latest:
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment: releases
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/install-nix-action
         with:
           dogfood: false # Use stable version
@@ -34,7 +34,7 @@ jobs:
           # get the same uberhack that nix-shell has to support it.
           echo "NIX_PATH=nixpkgs=$NIXPKGS_PATH" >> "$GITHUB_ENV"
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
         with:
           role-to-assume: "arn:aws:iam::080433136561:role/nix-release"
           role-session-name: nix-release-oidc-${{ github.run_id }}

@@ -7,14 +7,14 @@ TODO_NixOS
 needLocalStore "'--no-require-sigs' can’t be used with the daemon"
 
 # We can produce drvs directly into the binary cache
-clearStore
-clearCacheCache
 nix-instantiate --store "file://$cacheDir" dependencies.nix
 
-# Create the binary cache.
 clearStore
-clearCache
+clearBinaryCache
+
+# Create the binary cache.
 outPath=$(nix-build dependencies.nix --no-out-link)
+depPath=$(nix-build dependencies.nix -A input0_drv --no-out-link)
 
 nix copy --to "file://$cacheDir" "$outPath"
 
@@ -43,7 +43,7 @@ cacheDir2="$TEST_ROOT/binary+cache"
 nix copy --to "file://$cacheDir2" "$outPath" && [[ -d "$cacheDir2" ]]
 
 basicDownloadTests() {
-    # No uploading tests bcause upload with force HTTP doesn't work.
+    # No uploading tests because upload with force HTTP doesn't work.
 
     # By default, a binary cache doesn't support "nix-env -qas", but does
     # support installation.
@@ -84,6 +84,19 @@ basicDownloadTests
 # Test HttpBinaryCacheStore.
 export _NIX_FORCE_HTTP=1
 basicDownloadTests
+
+
+# Test that multiple concurrent substitutions do only one download.
+clearStore
+nix-store --init # needed because concurrent creation of the store can give SQLite errors
+_NIX_TEST_CONCURRENT_SUBSTITUTION=1 nix-store -r "$depPath" --substituters "file://$cacheDir" --no-require-sigs -vvvv 2> "$TEST_ROOT/log1" &
+pid1="$!"
+_NIX_TEST_CONCURRENT_SUBSTITUTION=1 nix-store -r "$depPath" --substituters "file://$cacheDir" --no-require-sigs -vvvv 2> "$TEST_ROOT/log2" &
+pid2="$!"
+wait "$pid1"
+wait "$pid2"
+[[ $(cat "$TEST_ROOT/log1" "$TEST_ROOT/log2" | grep -c "copying path ") -eq 2 ]]
+[[ $(cat "$TEST_ROOT/log1" "$TEST_ROOT/log2" | grep -c "downloading.*nar.xz") -eq 1 ]]
 
 
 # Test whether Nix notices if the NAR doesn't match the hash in the NAR info.
@@ -169,7 +182,7 @@ grepQuiet "building.*input-2" "$TEST_ROOT/log"
 
 
 # Create a signed binary cache.
-clearCache
+clearBinaryCache
 clearCacheCache
 
 nix key generate-secret --key-name test.nixos.org-1 > "$TEST_ROOT/sk1"
@@ -245,7 +258,7 @@ rm -rfv "$cacheDir/nar"
 
 
 # Test NAR listing generation.
-clearCache
+clearBinaryCache
 
 
 # preserve quotes variables in the single-quoted string
@@ -262,11 +275,31 @@ nix copy --to "file://$cacheDir"?write-nar-listing=1 "$outPath"
 
 diff -u \
     <(jq -S < "$cacheDir/$(basename "$outPath" | cut -c1-32).ls") \
-    <(echo '{"version":1,"root":{"type":"directory","entries":{"bar":{"type":"regular","size":4,"narOffset":232},"link":{"type":"symlink","target":"xyzzy"}}}}' | jq -S)
+    <(jq -S <<'EOF'
+{
+  "version": 1,
+  "root": {
+    "type": "directory",
+    "entries": {
+      "bar": {
+        "type": "regular",
+        "executable": false,
+        "size": 4,
+        "narOffset": 232
+      },
+      "link": {
+        "type": "symlink",
+        "target": "xyzzy"
+      }
+    }
+  }
+}
+EOF
+    )
 
 
 # Test debug info index generation.
-clearCache
+clearBinaryCache
 
 # preserve quotes variables in the single-quoted string
 # shellcheck disable=SC2016

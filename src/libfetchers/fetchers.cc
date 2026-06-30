@@ -1,13 +1,17 @@
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/store-api.hh"
+#include "nix/util/fs-sink.hh"
 #include "nix/util/source-path.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/json-utils.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/url.hh"
-#include "nix/util/archive.hh"
+#include "nix/util/users.hh"
+#include "nix/store/pathlocks.hh"
+#include "nix/util/environment-variables.hh"
 
+#include <thread>
 #include <nlohmann/json.hpp>
 
 namespace nix::fetchers {
@@ -163,8 +167,7 @@ bool Input::isFinal() const
 
 std::optional<std::filesystem::path> Input::isRelative() const
 {
-    assert(scheme);
-    return scheme->isRelative(*this);
+    return scheme ? scheme->isRelative(*this) : std::nullopt;
 }
 
 Attrs Input::toAttrs() const
@@ -272,23 +275,9 @@ void Input::checkLocks(Input specified, Input & result)
         }
     }
 
-    if (auto prevLastModified = specified.getLastModified()) {
-        if (result.getLastModified() != prevLastModified)
-            throw Error(
-                "'lastModified' attribute mismatch in input '%s', expected %d, got %d",
-                result.to_string(),
-                *prevLastModified,
-                result.getLastModified().value_or(-1));
-    }
-
     if (auto prevRev = specified.getRev()) {
         if (result.getRev() != prevRev)
             throw Error("'rev' attribute mismatch in input '%s', expected %s", result.to_string(), prevRev->gitRev());
-    }
-
-    if (auto prevRevCount = specified.getRevCount()) {
-        if (result.getRevCount() != prevRevCount)
-            throw Error("'revCount' attribute mismatch in input '%s', expected %d", result.to_string(), *prevRevCount);
     }
 }
 
@@ -330,6 +319,8 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
         try {
             auto storePath = computeStorePath(store);
 
+            store.addTempRoot(storePath);
+
             store.ensurePath(storePath);
 
             debug("using substituted/cached input '%s' in '%s'", to_string(), store.printStorePath(storePath));
@@ -356,6 +347,21 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
         }
     }
 
+    /* Acquire a path lock on this input. Note that fetching the same input in parallel is supposed to be safe (it's up
+     * to the fetchers to guarantee this), so this is merely intended to avoid work duplication. Note that we don't need
+     * this when substituting the input. */
+    auto lockFilePath =
+        getCacheDir() / "fetcher-locks"
+        / hashString(HashAlgorithm::SHA256, attrsToJSON(toAttrs()).dump()).to_string(HashFormat::Base16, false);
+    createDirs(lockFilePath.parent_path());
+    PathLocks lock(
+        {lockFilePath.string()}, fmt("waiting for another Nix process to finish fetching input '%s'...", to_string()));
+    lock.setDeletion(true);
+
+    static auto inTest = getEnv("_NIX_TEST_CONCURRENT_FETCHES") == "1";
+    if (inTest)
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
     auto [accessor, result] = scheme->getAccessor(settings, store, *this);
 
     if (!accessor->fingerprint)
@@ -375,19 +381,20 @@ Input Input::applyOverrides(std::optional<std::string> ref, std::optional<Hash> 
 
 void Input::clone(const Settings & settings, Store & store, const std::filesystem::path & destDir) const
 {
-    assert(scheme);
+    if (!scheme)
+        throw Error("cannot clone unsupported input '%s'", attrsToJSON(attrs));
     scheme->clone(settings, store, *this, destDir);
 }
 
 std::optional<std::filesystem::path> Input::getSourcePath() const
 {
-    assert(scheme);
-    return scheme->getSourcePath(*this);
+    return scheme ? scheme->getSourcePath(*this) : std::nullopt;
 }
 
 void Input::putFile(const CanonPath & path, std::string_view contents, std::optional<std::string> commitMsg) const
 {
-    assert(scheme);
+    if (!scheme)
+        throw Error("unsupported input '%s' does not support modifying file '%s'", attrsToJSON(attrs), path);
     return scheme->putFile(*this, path, contents, commitMsg);
 }
 

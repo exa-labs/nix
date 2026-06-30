@@ -4,6 +4,7 @@
 #include <variant>
 
 #include "nix/util/hash.hh"
+#include "nix/util/std-hash.hh"
 #include "nix/store/path.hh"
 #include "nix/store/derived-path.hh"
 #include <nlohmann/json_fwd.hpp>
@@ -65,6 +66,14 @@ struct UnkeyedRealisation
 
     std::string fingerprint(const DrvOutput & key) const;
 
+    /**
+     * Returns a signature but does not modify the stored signatures
+     */
+    Signature sign(const DrvOutput & key, const Signer &) const;
+
+    /**
+     * Inserts the new signature into the set of stored ones
+     */
     void sign(const DrvOutput & key, const Signer &);
 
     bool checkSignature(const DrvOutput & key, const PublicKeys & publicKeys, const Signature & sig) const;
@@ -154,6 +163,8 @@ struct RealisedPath
 
 class MissingRealisation final : public CloneableError<MissingRealisation, Error>
 {
+    void anchor() override;
+
 public:
     MissingRealisation(const StoreDirConfig & store, DrvOutput & outputId)
         : MissingRealisation(store, outputId.drvPath, outputId.outputName)
@@ -167,6 +178,26 @@ public:
         const StorePath & drvPathResolved,
         const OutputName & outputName);
 };
+
+} // namespace nix
+
+template<>
+struct std::hash<nix::DrvOutput>
+{
+    std::size_t operator()(const nix::DrvOutput & id) const noexcept
+    {
+        std::size_t h = 0;
+        nix::hash_combine(h, id.drvPath, id.outputName);
+        return h;
+    }
+};
+
+namespace nix {
+
+inline std::size_t hash_value(const DrvOutput & id)
+{
+    return std::hash<DrvOutput>{}(id);
+}
 
 } // namespace nix
 
