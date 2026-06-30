@@ -544,7 +544,7 @@ static void printString(std::string & res, std::string_view s)
        so the scan loop runs many iterations per escapable char. */
     static constexpr auto needsEscape = []() constexpr {
         std::array<bool, 256> table{};
-        table['"']  = true;
+        table['"'] = true;
         table['\\'] = true;
         table['\n'] = true;
         table['\r'] = true;
@@ -568,12 +568,23 @@ static void printString(std::string & res, std::string_view s)
         if (!s.empty()) {
             char esc[2] = {'\\', 0};
             switch (s.front()) {
-            case '"':  esc[1] = '"';  break;
-            case '\\': esc[1] = '\\'; break;
-            case '\n': esc[1] = 'n';  break;
-            case '\r': esc[1] = 'r';  break;
-            case '\t': esc[1] = 't';  break;
-            default: __builtin_unreachable();
+            case '"':
+                esc[1] = '"';
+                break;
+            case '\\':
+                esc[1] = '\\';
+                break;
+            case '\n':
+                esc[1] = 'n';
+                break;
+            case '\r':
+                esc[1] = 'r';
+                break;
+            case '\t':
+                esc[1] = 't';
+                break;
+            default:
+                __builtin_unreachable();
             }
             res.append(esc, 2);
             s.remove_prefix(1);

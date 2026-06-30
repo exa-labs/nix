@@ -1323,9 +1323,7 @@ struct GitFileSystemObjectSinkImpl final : GitFileSystemObjectSink
             git_oid oid;
             if (git_blob_create_from_stream_commit(&oid, crf->stream.release()))
                 throw GitError("creating a blob object for '%s'", path);
-            queueNode(
-                crf->path,
-                Child{crf->executable ? GIT_FILEMODE_BLOB_EXECUTABLE : GIT_FILEMODE_BLOB, oid, id});
+            queueNode(crf->path, Child{crf->executable ? GIT_FILEMODE_BLOB_EXECUTABLE : GIT_FILEMODE_BLOB, oid, id});
             return;
         }
 
@@ -1337,9 +1335,7 @@ struct GitFileSystemObjectSinkImpl final : GitFileSystemObjectSink
             if (git_blob_create_from_buffer(&oid, *repo, crf->contents.data(), crf->contents.size()))
                 throw GitError("creating a blob object for '%s' from in-memory buffer", crf->path);
 
-            queueNode(
-                crf->path,
-                Child{crf->executable ? GIT_FILEMODE_BLOB_EXECUTABLE : GIT_FILEMODE_BLOB, oid, id});
+            queueNode(crf->path, Child{crf->executable ? GIT_FILEMODE_BLOB_EXECUTABLE : GIT_FILEMODE_BLOB, oid, id});
         });
     }
 

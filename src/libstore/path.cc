@@ -38,10 +38,14 @@ void checkName(std::string_view name)
        1 (valid) or 0 (invalid). */
     static constexpr auto validChar = []() constexpr {
         std::array<bool, 256> table{};
-        for (int c = '0'; c <= '9'; ++c) table[c] = true;
-        for (int c = 'a'; c <= 'z'; ++c) table[c] = true;
-        for (int c = 'A'; c <= 'Z'; ++c) table[c] = true;
-        for (auto c : {'+', '-', '.', '_', '?', '='}) table[(unsigned char)c] = true;
+        for (int c = '0'; c <= '9'; ++c)
+            table[c] = true;
+        for (int c = 'a'; c <= 'z'; ++c)
+            table[c] = true;
+        for (int c = 'A'; c <= 'Z'; ++c)
+            table[c] = true;
+        for (auto c : {'+', '-', '.', '_', '?', '='})
+            table[(unsigned char) c] = true;
         return table;
     }();
     for (auto c : name)

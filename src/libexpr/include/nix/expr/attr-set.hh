@@ -352,11 +352,12 @@ public:
                     return;
 
                 current = attrs.attrs;
-                cursorHeap.push_back(BindingsCursor{
-                    .current = attrs.attrs,
-                    .end = attrs.attrs + attrs.numAttrs,
-                    .priority = 0,
-                });
+                cursorHeap.push_back(
+                    BindingsCursor{
+                        .current = attrs.attrs,
+                        .end = attrs.attrs + attrs.numAttrs,
+                        .priority = 0,
+                    });
                 return;
             }
 
@@ -365,17 +366,19 @@ public:
                 mode = Mode::TwoWay;
 
                 /* cursorHeap[0] = overlay (higher priority, the front layer). */
-                cursorHeap.push_back(BindingsCursor{
-                    .current = attrs.attrs,
-                    .end = attrs.attrs + attrs.numAttrs,
-                    .priority = 0,
-                });
+                cursorHeap.push_back(
+                    BindingsCursor{
+                        .current = attrs.attrs,
+                        .end = attrs.attrs + attrs.numAttrs,
+                        .priority = 0,
+                    });
                 /* cursorHeap[1] = base. */
-                cursorHeap.push_back(BindingsCursor{
-                    .current = attrs.baseLayer->attrs,
-                    .end = attrs.baseLayer->attrs + attrs.baseLayer->numAttrs,
-                    .priority = 1,
-                });
+                cursorHeap.push_back(
+                    BindingsCursor{
+                        .current = attrs.baseLayer->attrs,
+                        .end = attrs.baseLayer->attrs + attrs.baseLayer->numAttrs,
+                        .priority = 1,
+                    });
 
                 initTwoWay();
                 return;
@@ -388,11 +391,12 @@ public:
             unsigned priority = 0;
             while (layer) {
                 if (layer->numAttrs != 0) {
-                    cursorHeap.push_back(BindingsCursor{
-                        .current = layer->attrs,
-                        .end = layer->attrs + layer->numAttrs,
-                        .priority = priority,
-                    });
+                    cursorHeap.push_back(
+                        BindingsCursor{
+                            .current = layer->attrs,
+                            .end = layer->attrs + layer->numAttrs,
+                            .priority = priority,
+                        });
                 }
                 priority++;
                 layer = layer->baseLayer;

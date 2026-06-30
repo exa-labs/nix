@@ -32,7 +32,7 @@ std::string base16::encode(std::span<const std::byte> b)
     char * out = buf.data();
     for (size_t i = 0; i < b.size(); ++i) {
         auto & pair = hexTable[static_cast<uint8_t>(b[i])];
-        out[i * 2]     = pair[0];
+        out[i * 2] = pair[0];
         out[i * 2 + 1] = pair[1];
     }
     return buf;
