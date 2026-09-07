@@ -317,6 +317,8 @@ EvalState::EvalState(
     , debugRepl(nullptr)
     , debugStop(false)
     , trylevel(0)
+    , storeToSrc(make_ref<decltype(storeToSrc)::element_type>())
+    , sourceStoreToOriginalPath(make_ref<decltype(sourceStoreToOriginalPath)::element_type>())
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
@@ -2647,9 +2649,93 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
         nullptr,
         repair);
     allowPath(dstPath);
+    recordPathOrigin(dstPath, path);
 
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
     return dstPath;
+}
+
+std::optional<SourcePath> EvalState::getSourceOrigin(const StorePath & storePath) const
+{
+    return getConcurrent(*storeToSrc, storePath);
+}
+
+std::map<StorePath, SourcePath> EvalState::getSourceOrigins() const
+{
+    std::map<StorePath, SourcePath> result;
+    storeToSrc->cvisit_all([&](const auto & entry) { result.emplace(entry.first, entry.second); });
+    return result;
+}
+
+std::optional<std::filesystem::path> EvalState::getOriginalPath(const StorePath & storePath) const
+{
+    return getConcurrent(*sourceStoreToOriginalPath, storePath);
+}
+
+void EvalState::recordPathOrigin(const StorePath & storePath, const SourcePath & srcPath)
+{
+    /* This runs on every copyPathToStore(), so bail out cheaply if we
+       have already recorded this store path. */
+    if (!storeToSrc->try_emplace(storePath, srcPath))
+        return;
+
+    /* Try to resolve the original filesystem path right away, so that
+       `getOriginalPath()` can answer for this store path without
+       having to trace through accessor chains later. */
+
+    auto appendRel = [](const std::filesystem::path & root, const CanonPath & rel) {
+        return rel.isRoot() ? root : root / std::string(rel.rel());
+    };
+
+    /* Strategy 1: the source path refers to a store path within
+       `rootFS`/`storeFS` (e.g. `/nix/store/xxx-source/sub`, as is the
+       case for anything in a flake). If we know where that store path
+       came from, the original path is just the corresponding
+       subpath. */
+    if (srcPath.accessor == rootFS && store->isInStore(srcPath.path.abs())) {
+        auto [srcStorePath, rel] = store->toStorePath(srcPath.path.abs());
+        if (auto origRoot = getConcurrent(*sourceStoreToOriginalPath, srcStorePath)) {
+            sourceStoreToOriginalPath->try_emplace(storePath, appendRel(*origRoot, rel));
+            return;
+        }
+        /* A store path we know nothing about; don't fall through to
+           the `rootFS` physical path, which would just be the store
+           path itself. */
+        return;
+    }
+
+    /* Strategy 2: the accessor itself knows its original root
+       (per-input accessors created by the `git` and `path` input
+       schemes). */
+    if (srcPath.accessor->originalRootPath) {
+        sourceStoreToOriginalPath->try_emplace(storePath, appendRel(*srcPath.accessor->originalRootPath, srcPath.path));
+        return;
+    }
+
+    /* Strategy 3: the accessor is one that has been mounted in
+       `storeFS` by `mountInput()` and registered in
+       `sourceStoreToOriginalPath`. Find it by identity. Snapshot the
+       map first since we must not insert while iterating over a
+       concurrent map. */
+    if (srcPath.accessor != rootFS) {
+        std::vector<std::pair<StorePath, std::filesystem::path>> snapshot;
+        sourceStoreToOriginalPath->cvisit_all(
+            [&](const auto & entry) { snapshot.emplace_back(entry.first, entry.second); });
+
+        for (auto & [srcStorePath, origRoot] : snapshot) {
+            auto mount = storeFS->getMount(CanonPath(store->printStorePath(srcStorePath)));
+            if (mount && mount.get() == &*srcPath.accessor) {
+                sourceStoreToOriginalPath->try_emplace(storePath, appendRel(origRoot, srcPath.path));
+                return;
+            }
+        }
+        return;
+    }
+
+    /* Strategy 4: a plain path in the ambient filesystem (e.g. `nix
+       derivation source-origins -f ./foo.nix`). */
+    if (auto physical = srcPath.getPhysicalPath())
+        sourceStoreToOriginalPath->try_emplace(storePath, *physical);
 }
 
 SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)

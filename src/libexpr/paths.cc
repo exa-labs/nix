@@ -3,6 +3,8 @@
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 
+#include <boost/unordered/concurrent_flat_map.hpp>
+
 namespace nix {
 
 SourcePath EvalState::rootPath(CanonPath path)
@@ -75,6 +77,21 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
     allowPath(storePath); // FIXME: should just whitelist the entire virtual store
 
     storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
+
+    /* Record where this source tree came from in the local filesystem
+       (if anywhere) so that `nix derivation source-origins` can map
+       store paths derived from it back to their original location.
+       Prefer the accessor's `originalRootPath` (set by the `git` and
+       `path` input schemes to the root of the source tree) over
+       `input.getSourcePath()`, which for a git-tracked flake in a
+       subdirectory would be the flake directory rather than the repo
+       root. */
+    if (accessor->originalRootPath)
+        sourceStoreToOriginalPath->try_emplace(storePath, *accessor->originalRootPath);
+    else if (auto origPath = input.getSourcePath(); origPath && !store->isInStore(origPath->string())) {
+        accessor->originalRootPath = *origPath;
+        sourceStoreToOriginalPath->try_emplace(storePath, *origPath);
+    }
 
     input.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
 

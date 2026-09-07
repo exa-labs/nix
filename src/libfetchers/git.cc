@@ -1001,6 +1001,11 @@ struct GitInputScheme : InputScheme
         ref<SourceAccessor> accessor =
             repo->getAccessor(repoInfo.workdirInfo, {.exportIgnore = exportIgnore}, makeNotAllowedError(repoPath));
 
+        /* Remember the repo root so that store paths derived from this
+           accessor can be mapped back to the working tree (see `nix
+           derivation source-origins`). */
+        accessor->originalRootPath = repoPath;
+
         /* If the repo has submodules, return a mounted input accessor
            consisting of the accessor for the top-level repo and, per
            submodule, either its workdir accessor or an empty directory
@@ -1038,6 +1043,8 @@ struct GitInputScheme : InputScheme
 
             mounts.insert_or_assign(CanonPath::root, accessor);
             accessor = makeMountedSourceAccessor(std::move(mounts));
+            /* The submodule workdirs live under the same root. */
+            accessor->originalRootPath = repoPath;
         }
 
         if (!repoInfo.workdirInfo.isDirty) {
