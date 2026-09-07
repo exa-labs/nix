@@ -1,0 +1,73 @@
+name: "Exa build"
+
+# Fork CI for exa-labs/nix: build the Nix CLI and run the flake checks on
+# the three platforms we ship (x86_64-linux, aarch64-linux, aarch64-darwin),
+# all on GitHub-hosted runners. Upstream's ci.yml is left untouched (and
+# gated to the NixOS org) to keep rebases onto NixOS/nix conflict-free.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# This workflow only builds and tests; it never publishes anything.
+permissions: read-all # zizmor: ignore[excessive-permissions]
+
+jobs:
+  build:
+    name: build (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/install-nix-action
+        with:
+          # Never dogfood: that downloads installer artifacts from the
+          # NixOS/nix CI runs, which this fork cannot access.
+          dogfood: false
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # The sandbox would otherwise be disabled by default on Darwin.
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            sandbox = true
+      # Since Ubuntu 23.10, unprivileged user namespaces are no longer allowed
+      # to map to the root user, which the Nix sandbox tests rely on:
+      # https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        if: runner.os == 'Linux'
+      - name: Build nix-cli
+        run: nix build .#packages.${{ matrix.system }}.nix-cli -L --out-link result-nix
+      - name: Show version
+        run: ./result-nix/bin/nix --version
+      - name: Run flake checks
+        run: nix flake check . -L --keep-going --system ${{ matrix.system }}
+
+  success:
+    name: Exa build success
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+    if: ${{ always() }}
+    steps:
+      - name: Exit with any errors
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
