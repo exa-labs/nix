@@ -296,9 +296,17 @@ void HttpBinaryCacheStore::getFile(const std::string & path, Callback<std::optio
 {
     auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
 
+    /* Fail fast on a disabled cache before touching the transfer queue,
+       so the only code that can complete the callback afterwards is the
+       transfer's own completion handler. */
     try {
         checkEnabled();
+    } catch (...) {
+        callbackPtr->rethrow();
+        return;
+    }
 
+    try {
         auto request(makeRequest(path));
 
         fileTransfer->enqueueFileTransfer(request, {[callbackPtr, this](std::future<FileTransferResult> result) {
