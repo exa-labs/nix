@@ -1,7 +1,12 @@
 {
   description = "The purely functional package manager";
 
-  inputs.nixpkgs.url = "https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz";
+  # nixpkgs, flake-parts and git-hooks.nix are pinned through the internal
+  # GitHub tarball mirror (tarball.internal.exa.ai) at fixed revisions so that
+  # evaluators inside the Exa network fetch them from the mirror rather than
+  # from GitHub / channels.nixos.org. The nixpkgs rev is the one behind
+  # upstream's nixos-26.05 channel pin at the time of the last bump.
+  inputs.nixpkgs.url = "tarball+https://tarball.internal.exa.ai/github/NixOS/nixpkgs/a50de1b7d8a586adc18d2395c19de7d6058e6030.tar.gz";
 
   inputs.nixpkgs-regression.url = "github:NixOS/nixpkgs/215d4d0fd80ca5163643b03a33fde804a29cc1e2";
   inputs.nixpkgs-23-11.url = "github:NixOS/nixpkgs/a62e6edd6d5e1fa0329b8653c801147986f8d446";
@@ -11,8 +16,8 @@
   };
 
   # dev tooling
-  inputs.flake-parts.url = "github:hercules-ci/flake-parts";
-  inputs.git-hooks-nix.url = "github:cachix/git-hooks.nix";
+  inputs.flake-parts.url = "tarball+https://tarball.internal.exa.ai/github/hercules-ci/flake-parts/17c9d6cdfc60c64f4ee8d306f9bc0b4ccb51481e.tar.gz";
+  inputs.git-hooks-nix.url = "tarball+https://tarball.internal.exa.ai/github/cachix/git-hooks.nix/bca82caa46d5ec0f5d422c61fb1e30bc51313cbe.tar.gz";
   # work around https://github.com/NixOS/nix/issues/7730
   inputs.flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
   inputs.git-hooks-nix.inputs.nixpkgs.follows = "nixpkgs";
