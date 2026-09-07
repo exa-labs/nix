@@ -29,13 +29,23 @@ let
 
   baseVersion = lib.fileContents ../.version;
 
-  versionSuffix = lib.optionalString (!officialRelease) "pre";
+  # Exa fork marker. Appended as an extra, purely alphabetic version
+  # component so that binaries built from this fork are identifiable
+  # (`nix --version`, `builtins.nixVersion`, User-Agent, store info) while
+  # remaining well-formed for `builtins.compareVersions`, `nix-env` name
+  # parsing and Meson: "2.36.0pre-exa" still sorts between 2.35.x and 2.36.0,
+  # exactly like upstream's "2.36.0pre" (and "2.36.0-exa" between 2.36.0 and
+  # 2.36.1 for official releases).
+  exaSuffix = "-exa";
+
+  versionSuffix = lib.optionalString (!officialRelease) "pre" + exaSuffix;
 
   fineVersionSuffix =
     lib.optionalString (!officialRelease)
       "pre${
         builtins.substring 0 8 (src.lastModifiedDate or src.lastModified or "19700101")
-      }_${src.shortRev or "dirty"}";
+      }_${src.shortRev or "dirty"}"
+    + exaSuffix;
 
   fineVersion = baseVersion + fineVersionSuffix;
 
