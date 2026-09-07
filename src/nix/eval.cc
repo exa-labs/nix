@@ -1,12 +1,16 @@
 #include "nix/cmd/command-installable-value.hh"
+#include "nix/cmd/installable-flake.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/eval-cache.hh"
+#include "nix/expr/print.hh"
 #include "nix/expr/value-to-json.hh"
 
 #include <nlohmann/json.hpp>
+#include <sstream>
 
 namespace nix {
 
@@ -63,6 +67,40 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             throw UsageError("--raw and --json are mutually exclusive");
 
         auto state = getEvalState();
+
+        /* Fast path: for a plain flake attribute eval (no --apply, no
+           --write-to), try to serve a string value straight from the
+           eval cache. This skips evaluating the flake (and in particular
+           derivationStrict) entirely when the inputs haven't changed.
+           cachedGetStringWithContext() only returns on a genuine cache
+           hit, so we never use a value that would have required
+           evaluation. */
+        if (!apply && !writeTo) {
+            if (auto flakeInstallable = dynamic_cast<InstallableFlake *>(&*installable)) {
+                std::optional<eval_cache::string_t> cached;
+                try {
+                    cached = flakeInstallable->getCursor(*state, AutoCall::No)->cachedGetStringWithContext();
+                } catch (Error &) {
+                    /* Fall through to full evaluation, which will report
+                       the error properly if it recurs. */
+                }
+                if (cached) {
+                    auto & [s, ctx] = *cached;
+                    if (raw) {
+                        logger->stop();
+                        writeFull(getStandardOutput(), s);
+                    } else if (json) {
+                        printJSON(nlohmann::json(s));
+                    } else {
+                        std::ostringstream out;
+                        printLiteralString(out, s);
+                        logger->cout("%s", out.str());
+                    }
+                    state->ensureLazyPathsCopied(ctx);
+                    return;
+                }
+            }
+        }
 
         auto [v, pos] = installable->toValue(*state, AutoCall::No);
         NixStringContext context;
