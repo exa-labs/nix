@@ -8,13 +8,25 @@ namespace nix {
 
 constexpr static const std::array<char, 16> base16Chars = "0123456789abcdef"_arrayNoNull;
 
+/**
+ * Byte -> two hex digits, so encoding is a single table lookup per
+ * byte instead of two nibble lookups.
+ */
+constexpr static const std::array<std::array<char, 2>, 256> base16Pairs = [] {
+    std::array<std::array<char, 2>, 256> table{};
+    for (size_t i = 0; i < table.size(); ++i)
+        table[i] = {base16Chars[i >> 4], base16Chars[i & 0x0f]};
+    return table;
+}();
+
 std::string base16::encode(std::span<const std::byte> b)
 {
-    std::string buf;
-    buf.reserve(b.size() * 2);
-    for (size_t i = 0; i < b.size(); i++) {
-        buf.push_back(base16Chars[(uint8_t) b.data()[i] >> 4]);
-        buf.push_back(base16Chars[(uint8_t) b.data()[i] & 0x0f]);
+    std::string buf(b.size() * 2, '\0');
+    char * out = buf.data();
+    for (auto byte : b) {
+        auto & pair = base16Pairs[static_cast<uint8_t>(byte)];
+        *out++ = pair[0];
+        *out++ = pair[1];
     }
     return buf;
 }
