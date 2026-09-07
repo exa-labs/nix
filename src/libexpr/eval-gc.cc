@@ -74,6 +74,17 @@ static inline void initGCReal()
 
     GC_set_oom_fn(oomHandler);
 
+    /* Grow the heap aggressively instead of collecting frequently. The
+       libgc default free space divisor is 3, i.e. the heap grows by
+       ~33% after a collection; 1 makes it double, roughly halving the
+       number of collections. On a full-nixpkgs evaluation this is
+       ~20% less wall time for ~30% more peak RSS. Like
+       GC_INITIAL_HEAP_SIZE below, libgc already honours the
+       GC_FREE_SPACE_DIVISOR environment variable in GC_INIT(), so only
+       apply our default when the user hasn't set it. */
+    if (!getEnv("GC_FREE_SPACE_DIVISOR"))
+        GC_set_free_space_divisor(1);
+
     /* Funnel boehm warnings into debug logs. */
     GC_set_warn_proc([](char * msg, GC_word word) noexcept {
         std::array<char, 4096> buffer{};
