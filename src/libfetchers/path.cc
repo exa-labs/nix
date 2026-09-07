@@ -163,6 +163,14 @@ struct PathInputScheme : InputScheme
 
         auto accessor = store.requireStoreObjectAccessor(*storePath);
 
+        // Remember where the contents came from so that store paths
+        // derived from this accessor can be mapped back to the
+        // original filesystem location (see `nix derivation
+        // source-origins`). Don't do this if the input *is* a store
+        // path already, since that tells us nothing about provenance.
+        if (!store.isInStore(absPath.string()))
+            accessor->originalRootPath = absPath;
+
         // To prevent `fetchToStore()` copying the path again to Nix
         // store, pre-create an entry in the fetcher cache.
         auto narHash = store.queryPathInfo(*storePath)->narHash.to_string(HashFormat::SRI, true);

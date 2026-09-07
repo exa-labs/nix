@@ -271,6 +271,7 @@ nix3_manpages = [
   'nix3-derivation',
   'nix3-derivation-add',
   'nix3-derivation-show',
+  'nix3-derivation-source-origins',
   'nix3-develop',
   'nix3-edit',
   'nix3-env',

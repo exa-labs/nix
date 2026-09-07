@@ -499,6 +499,24 @@ public:
 private:
 
     /**
+     * Reverse mapping from store paths back to the source paths they
+     * were copied from during this evaluation. Populated by
+     * `copyPathToStore()` and `recordPathOrigin()` so that provenance
+     * can be recovered afterwards (see `nix derivation
+     * source-origins`).
+     */
+    const ref<boost::concurrent_flat_map<StorePath, SourcePath>> storeToSrc;
+
+    /**
+     * Mapping from source store paths (e.g. `/nix/store/xxx-source`)
+     * to the original filesystem paths they were obtained from (e.g.
+     * `/home/user/project`). Populated by `mountInput()` for inputs
+     * whose accessor has an `originalRootPath` (such as `path:` and
+     * `git+file:` inputs) and by `recordPathOrigin()`.
+     */
+    const ref<boost::concurrent_flat_map<StorePath, std::filesystem::path>> sourceStoreToOriginalPath;
+
+    /**
      * A cache that maps paths to "resolved" paths for importing Nix
      * expressions, i.e. `/foo` to `/foo/default.nix`.
      */
@@ -613,6 +631,36 @@ public:
      * Allow access to a store path and return it as a string.
      */
     void allowAndSetStorePathString(const StorePath & storePath, Value & v);
+
+    /**
+     * Look up the source path from which a store path was copied
+     * during this evaluation. Returns `std::nullopt` when the store
+     * path wasn't produced by this evaluator (e.g. it came from a
+     * substituter or a previous evaluation).
+     */
+    std::optional<SourcePath> getSourceOrigin(const StorePath & storePath) const;
+
+    /**
+     * Return the full store path → source path mapping built during
+     * this evaluation.
+     */
+    std::map<StorePath, SourcePath> getSourceOrigins() const;
+
+    /**
+     * Look up the original filesystem path for a store path that was
+     * obtained from a local filesystem location (e.g. a `path:` flake
+     * input, or a filtered source thereof). Returns `std::nullopt` if
+     * no such mapping is known.
+     */
+    std::optional<std::filesystem::path> getOriginalPath(const StorePath & storePath) const;
+
+    /**
+     * Record that `storePath` was produced from `srcPath`, and try to
+     * resolve `srcPath` to an original filesystem path. Used by
+     * `addPath()` (`builtins.path` / `builtins.filterSource`) so that
+     * filtered sources also appear in the provenance maps.
+     */
+    void recordPathOrigin(const StorePath & storePath, const SourcePath & srcPath);
 
     void checkURI(const std::string & uri);
 

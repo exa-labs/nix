@@ -208,6 +208,15 @@ public:
     CanonPath resolveSymlinks(const CanonPath & path, SymlinkResolution mode = SymlinkResolution::Full);
 
     /**
+     * For accessors whose contents were obtained from a local
+     * filesystem path (e.g. `path:` or `git+file:` flake inputs), this
+     * records the original filesystem root so that store paths derived
+     * from this accessor can be mapped back to their original
+     * locations (see `nix derivation source-origins`).
+     */
+    std::optional<std::filesystem::path> originalRootPath;
+
+    /**
      * A string that uniquely represents the contents of this
      * accessor. This is used for caching lookups (see `fetchToStore()`).
      */

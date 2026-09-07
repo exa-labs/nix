@@ -2959,9 +2959,16 @@ static void addPath(
                 state.error<EvalError>("store path mismatch in (possibly filtered) path added from '%s'", path)
                     .atPos(noPos)
                     .debugThrow();
+            /* Record provenance so that `nix derivation source-origins`
+               can trace filtered paths (`builtins.path`,
+               `builtins.filterSource`, `cleanSourceWith`) back to their
+               original source location. */
+            state.recordPathOrigin(dstPath, path);
             state.allowAndSetStorePathString(dstPath, v);
-        } else
+        } else {
+            state.recordPathOrigin(*expectedStorePath, path);
             state.allowAndSetStorePathString(*expectedStorePath, v);
+        }
     } catch (Error & e) {
         e.addTrace(nullptr, "while adding path '%s'", path);
         throw;
