@@ -1,6 +1,6 @@
 name: "Exa release"
 
-# Publishes a GitHub release for every push to master (or on demand) with:
+# Publishes a GitHub release for every push to the `exa` branch (or on demand) with:
 #
 # * exa-nix-<version>-<shortrev>.pkg: a macOS installer package wrapping the
 #   embedded-closure Rust installer (packaging/rust-installer), for
@@ -25,7 +25,7 @@ name: "Exa release"
 on:
   push:
     branches:
-      - master
+      - exa
   workflow_dispatch:
 
 concurrency:
