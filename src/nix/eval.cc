@@ -1,12 +1,16 @@
 #include "nix/cmd/command-installable-value.hh"
+#include "nix/cmd/installable-flake.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/eval-cache.hh"
+#include "nix/expr/print.hh"
 #include "nix/expr/value-to-json.hh"
 
 #include <nlohmann/json.hpp>
+#include <sstream>
 
 namespace nix {
 
@@ -64,7 +68,40 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
 
         auto state = getEvalState();
 
-        auto [v, pos] = installable->toValue(*state, AutoCall::No);
+        /* Fast path: for a plain flake attribute eval (no --apply, no
+           --write-to), try to serve a string value straight from the
+           eval cache. This skips evaluating the flake (and in particular
+           derivationStrict) entirely when the inputs haven't changed.
+           cachedGetStringWithContext() only returns on a genuine cache
+           hit, so we never use a value that would have required
+           evaluation. */
+        std::pair<Value *, PosIdx> valueAndPos;
+        auto flakeInstallable = dynamic_cast<InstallableFlake *>(&*installable);
+        if (flakeInstallable && !apply && !writeTo) {
+            /* Resolve the cursor once and reuse it for the slow path;
+               InstallableFlake::toValue() is exactly
+               getCursor()->forceValue(). */
+            auto cursor = flakeInstallable->getCursor(*state, AutoCall::No);
+            if (auto cached = cursor->cachedGetStringWithContext()) {
+                auto & [s, ctx] = *cached;
+                if (raw) {
+                    logger->stop();
+                    writeFull(getStandardOutput(), s);
+                } else if (json) {
+                    printJSON(nlohmann::json(s));
+                } else {
+                    std::ostringstream out;
+                    printLiteralString(out, s);
+                    logger->cout("%s", out.str());
+                }
+                state->ensureLazyPathsCopied(ctx);
+                return;
+            }
+            valueAndPos = {&cursor->forceValue(), noPos};
+        } else
+            valueAndPos = installable->toValue(*state, AutoCall::No);
+
+        auto [v, pos] = valueAndPos;
         NixStringContext context;
 
         if (apply) {
