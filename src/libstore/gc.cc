@@ -493,6 +493,12 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                             } else
                                 printError("received garbage instead of a root from client");
                             writeFull(fdClient.get(), "1", false);
+                        } catch (Interrupted &) {
+                            /* Interrupted derives from BaseError, not Error,
+                               so it would otherwise escape this std::thread
+                               and terminate the whole daemon. */
+                            debug("interrupted while reading GC root from client");
+                            break;
                         } catch (Error & e) {
                             debug("reading GC root from client: %s", e.msg());
                             break;
@@ -918,6 +924,15 @@ void LocalStore::autoGC(bool sync)
         auto state(_state->lock());
 
         if (state->gcRunning) {
+            /* An auto-GC pass is already running. Only wait for it if free
+               space is currently below the min-free floor: a pass over a
+               large store can take hours, and unconditionally waiting here
+               blocks every store add on the machine for its entire
+               duration, even with plenty of free space. Adds are safe to
+               run concurrently with GC (they go through the temp-roots
+               protocol), so above the floor let them proceed. */
+            if (!sync || getAvail() >= gcSettings.minFree)
+                return;
             future = state->gcFuture;
             debug("waiting for auto-GC to finish");
             goto sync;

@@ -18,8 +18,9 @@ std::vector<std::string> InstallableFlake::getActualAttrPaths()
 {
     std::vector<std::string> res;
     if (attrPaths.size() == 1 && attrPaths.front().starts_with(".")) {
-        attrPaths.front().erase(0, 1);
-        res.push_back(attrPaths.front());
+        /* Absolute attribute path: don't apply the prefixes. Don't mutate
+           `attrPaths` here, or a second call would see a relative path. */
+        res.push_back(attrPaths.front().substr(1));
         return res;
     }
 

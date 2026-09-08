@@ -116,13 +116,18 @@ inline void MonitorFdHup::runThread(int watchFd, int notifyFd)
             }
         }
 
-        if (fds[0].revents & POLLHUP) {
+        // Treat an errored or invalid descriptor like a hangup. Without
+        // POLLERR/POLLNVAL a broken client socket is never reported as
+        // POLLHUP, so poll() returns immediately forever and this thread
+        // spins at 100% CPU while the worker never notices the client
+        // is gone.
+        if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
             unix::triggerInterrupt();
             break;
         }
 
-        if (fds[1].revents & POLLHUP) {
-            // Notify pipe closed, exit thread
+        if (fds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            // Notify pipe closed or became invalid, exit thread.
             break;
         }
     }

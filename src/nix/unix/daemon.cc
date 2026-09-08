@@ -362,6 +362,18 @@ static void daemonLoop(
                         if (setsid() == -1)
                             throw SysError("creating a new session");
 
+                        // The daemon's signal handler thread does not survive
+                        // fork(), but this worker inherits the daemon's *blocked*
+                        // signal mask, so without a thread to sigwait() on them
+                        // SIGTERM/SIGINT/SIGPIPE would never be seen. Restore the
+                        // mask saved at daemon startup first, because
+                        // startSignalHandlerThread() re-saves the current mask
+                        // unconditionally; otherwise the blocked mask would be
+                        // persisted and later reapplied to build children via
+                        // restoreProcessContext().
+                        unix::restoreSignals();
+                        unix::startSignalHandlerThread();
+
                         // Restore normal handling of SIGCHLD.
                         setSigChldAction(false);
 
