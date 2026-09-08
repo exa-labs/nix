@@ -23,6 +23,7 @@ permissions: read-all # zizmor: ignore[excessive-permissions]
 
 jobs:
   eval:
+    if: github.repository_owner == 'NixOS' # fork CI lives in exa-build.yml
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,6 +40,7 @@ jobs:
     - run: nix flake show --all-systems --json
 
   pre-commit-checks:
+    if: github.repository_owner == 'NixOS' # fork CI lives in exa-build.yml
     name: pre-commit checks
     runs-on: ubuntu-24.04
     steps:
@@ -54,7 +56,7 @@ jobs:
 
   basic-checks:
     name: aggregate basic checks
-    if: ${{ always() }}
+    if: ${{ always() && github.repository_owner == 'NixOS' }}
     runs-on: ubuntu-24.04
     needs: [pre-commit-checks, eval]
     steps:

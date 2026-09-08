@@ -1,0 +1,215 @@
+name: "Exa release"
+
+# Publishes a GitHub release for every push to the `exa` branch (or on demand) with:
+#
+# * exa-nix-<version>-<shortrev>.pkg: a macOS installer package wrapping the
+#   embedded-closure Rust installer (packaging/rust-installer), for
+#   distribution via MDM.
+# * A flat, signed binary cache of the nix-cli closure for every supported
+#   system (x86_64-linux, aarch64-linux, aarch64-darwin), so consumers can
+#   substitute the prebuilt fork straight from the release:
+#     extra-substituters = https://github.com/<owner>/<repo>/releases/download/<tag>
+#     extra-trusted-public-keys = <contents of the public-key asset>
+# * store-paths-<system>: the closure root for each system.
+# * public-key: the narinfo signing public key.
+#
+# Secrets:
+#   NIX_RELEASE_SIGNING_KEY      `nix key generate-secret` output used to sign
+#                                the narinfos (cache is unsigned if absent).
+#   INSTALLER_SIGNING_IDENTITY   optional "Developer ID Installer: ..."
+#                                identity used to sign the .pkg.
+#   INSTALLER_SIGNING_CERT_P12   optional base64-encoded .p12 holding that
+#                                identity, imported into a throwaway keychain.
+#   INSTALLER_SIGNING_CERT_PASSWORD  password of the .p12 above.
+
+on:
+  push:
+    branches:
+      - exa
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Public key of the Exa S3 binary cache, trusted by MDM-installed machines
+  # in addition to the release cache signing key derived below.
+  EXA_S3_CACHE_PUBLIC_KEY: "exa-nix-s3-cache-1:mxdfgAYd0CqvvfP9XaOnE1i7lrUACRIIt68iShEGKCA="
+
+jobs:
+  cache:
+    name: nix-cli cache (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-nix-action
+        with:
+          dogfood: false
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Build nix-cli
+        run: nix build .#packages.${{ matrix.system }}.nix-cli -L --out-link result-nix
+      - name: Show version
+        run: ./result-nix/bin/nix --version
+      - name: Create binary cache for the nix-cli closure
+        env:
+          NIX_RELEASE_SIGNING_KEY: ${{ secrets.NIX_RELEASE_SIGNING_KEY }}
+          SYSTEM: ${{ matrix.system }}
+        run: |
+          ./.github/scripts/make-release-cache.sh result-nix cache
+          mv cache/store-paths "cache/store-paths-$SYSTEM"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-cache-${{ matrix.system }}
+          path: cache
+          if-no-files-found: error
+
+  pkg:
+    name: macOS pkg
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      NIX_RELEASE_SIGNING_KEY: ${{ secrets.NIX_RELEASE_SIGNING_KEY }}
+      INSTALLER_SIGNING_IDENTITY: ${{ secrets.INSTALLER_SIGNING_IDENTITY }}
+      INSTALLER_SIGNING_CERT_P12: ${{ secrets.INSTALLER_SIGNING_CERT_P12 }}
+      INSTALLER_SIGNING_CERT_PASSWORD: ${{ secrets.INSTALLER_SIGNING_CERT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-nix-action
+        with:
+          dogfood: false
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Build Rust installer with embedded Nix
+        run: nix build .#hydraJobs.rustInstaller.aarch64-darwin -L --out-link result-installer
+      - name: Derive the release cache public key
+        id: pubkey
+        run: |
+          if [[ -n "$NIX_RELEASE_SIGNING_KEY" ]]; then
+            printf '%s' "$NIX_RELEASE_SIGNING_KEY" | nix key convert-secret-to-public > public-key
+            echo "public-key=$(cat public-key)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Import installer signing certificate
+        # Step-level env is not visible to the step's own `if`, hence the
+        # job-level env above.
+        if: env.INSTALLER_SIGNING_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/exa-nix-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          printf '%s' "$INSTALLER_SIGNING_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$INSTALLER_SIGNING_CERT_PASSWORD" -T /usr/bin/productbuild -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+      - name: Build .pkg
+        id: build
+        env:
+          EXTRA_TRUSTED_PUBLIC_KEYS: ${{ env.EXA_S3_CACHE_PUBLIC_KEY }} ${{ steps.pubkey.outputs.public-key }}
+        run: |
+          version="$(cat .version)"
+          shortrev="${GITHUB_SHA:0:7}"
+          pkg="exa-nix-${version}-${shortrev}.pkg"
+          ./.github/scripts/build-macos-pkg.sh \
+            result-installer/bin/nix-installer "$version" "$pkg"
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-pkg
+          path: ${{ steps.build.outputs.pkg }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs:
+      - cache
+      - pkg
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-nix-action
+        with:
+          dogfood: false
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Download the per-system caches
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-cache-*
+          path: release
+          # nars/narinfos shared between closures (e.g. source tarballs) are
+          # content-addressed by name, so merging the directories is safe.
+          merge-multiple: true
+      - name: Download the macOS pkg
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-pkg
+          path: release
+      - name: Publish the narinfo signing public key
+        env:
+          NIX_RELEASE_SIGNING_KEY: ${{ secrets.NIX_RELEASE_SIGNING_KEY }}
+        run: |
+          if [[ -n "$NIX_RELEASE_SIGNING_KEY" ]]; then
+            printf '%s' "$NIX_RELEASE_SIGNING_KEY" | nix key convert-secret-to-public > release/public-key
+          else
+            echo "::warning ::NIX_RELEASE_SIGNING_KEY is not set; the release cache is unsigned"
+          fi
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(cat .version)"
+          shortrev="${GITHUB_SHA:0:7}"
+          tag="exa-${version}-${shortrev}"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          {
+            echo "Exa Nix ${version} built from ${GITHUB_SHA}."
+            echo
+            echo "* \`exa-nix-${version}-${shortrev}.pkg\`: macOS installer package (MDM-ready)."
+            echo "* Flat binary cache of the nix-cli closure for x86_64-linux, aarch64-linux and aarch64-darwin:"
+            echo
+            echo '  ```'
+            echo "  extra-substituters = ${url}"
+            if [[ -e release/public-key ]]; then
+              echo "  extra-trusted-public-keys = $(cat release/public-key)"
+            fi
+            echo '  ```'
+            echo
+            echo "* \`store-paths-<system>\`: closure root per system, e.g. \`nix copy --from ${url} \$(curl -L ${url}/store-paths-x86_64-linux)\`."
+            echo "* \`public-key\`: narinfo signing public key."
+          } > notes.md
+          ls -la release
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes-file notes.md \
+            release/*
