@@ -58,8 +58,16 @@ jobs:
         run: nix build .#packages.${{ matrix.system }}.nix-cli -L --out-link result-nix
       - name: Show version
         run: ./result-nix/bin/nix --version
+      # Same test entry points upstream's ci.yml uses. `nix flake check` is
+      # deliberately not used: it evaluates every `packages.*` attribute,
+      # including cross targets (mingw, FreeBSD) that don't evaluate on
+      # every host platform.
+      - name: Run component tests
+        run: |
+          nix build --file ci/gha/tests/wrapper.nix componentTests -L \
+            --arg withInstrumentation false --argstr stdenv stdenv
       - name: Run flake checks
-        run: nix flake check . -L --keep-going --system ${{ matrix.system }}
+        run: ci/gha/tests/build-checks
 
   success:
     name: Exa build success
